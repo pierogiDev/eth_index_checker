@@ -1,0 +1,14 @@
+# Build artifacts
+/target/
+
+# Backup files
+**/*.rs.bk
+
+# Logs
+screenlog.*
+*.log
+
+# Environment secrets
+.env
+.env.*
+!.env.example
