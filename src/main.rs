@@ -256,6 +256,10 @@ async fn main() -> Result<()> {
     }
 
     if checks.tx_gap {
+        info!(
+            "Starting transaction table gap detection for `{}` (block column = `{}`).",
+            args.transactions_table, args.transactions_block_column
+        );
         match fetch_table_stats(
             &client,
             &args.transactions_table,
@@ -264,11 +268,21 @@ async fn main() -> Result<()> {
         )
         .await?
         {
-            None => println!(
-                "No transactions found in table `{}`. Skipping transaction gap check.",
-                args.transactions_table
-            ),
+            None => {
+                info!(
+                    "Transaction table `{}` returned no rows; skipping gap detection.",
+                    args.transactions_table
+                );
+                println!(
+                    "No transactions found in table `{}`. Skipping transaction gap check.",
+                    args.transactions_table
+                );
+            }
             Some(tx_stats) => {
+                info!(
+                    "Loaded transaction stats: range {}…{}, {} distinct block number(s), {} total row(s).",
+                    tx_stats.min, tx_stats.max, tx_stats.distinct_count, tx_stats.total_rows
+                );
                 println!(
                     "Transaction block range: {}…{} ({} distinct block numbers, {} total rows)",
                     tx_stats.min, tx_stats.max, tx_stats.distinct_count, tx_stats.total_rows
@@ -281,11 +295,19 @@ async fn main() -> Result<()> {
                     .checked_add(1)
                     .context("Transaction block number range overflow")?;
                 if expected_blocks == tx_stats.distinct_count {
+                    info!(
+                        "No transaction block gaps detected between {} and {} in `{}`.",
+                        tx_stats.min, tx_stats.max, args.transactions_table
+                    );
                     println!(
                         "No gaps detected between {} and {} in transactions table `{}`.",
                         tx_stats.min, tx_stats.max, args.transactions_table
                     );
                 } else {
+                    info!(
+                        "Scanning `{}` for missing transaction block ranges...",
+                        args.transactions_table
+                    );
                     let missing_ranges = find_missing_ranges(
                         &client,
                         &args.transactions_table,
@@ -293,8 +315,21 @@ async fn main() -> Result<()> {
                         tx_meta.apply_final,
                     )
                     .await?;
+                    let missing_total: u64 = missing_ranges
+                        .iter()
+                        .map(|(start, end)| if end < start { 0 } else { end - start + 1 })
+                        .sum();
+                    info!(
+                        "Detected {} missing transaction block(s) across {} gap(s).",
+                        missing_total,
+                        missing_ranges.len()
+                    );
                     let context = format!("transactions table `{}`", args.transactions_table);
                     report_missing_ranges(&missing_ranges, &context);
+                    info!(
+                        "Finished transaction gap detection for `{}`.",
+                        args.transactions_table
+                    );
                 }
             }
         }
@@ -425,8 +460,8 @@ async fn find_missing_ranges(
     let final_clause = final_clause(use_final);
     let query = format!(
         "SELECT \
-            assumeNotNull(prev_block) + 1 AS gap_start, \
-            current_block - 1 AS gap_end \
+            toUInt64(assumeNotNull(prev_block) + 1) AS gap_start, \
+            toUInt64(current_block - 1) AS gap_end \
          FROM ( \
             SELECT \
                 {col} AS current_block, \
@@ -441,11 +476,38 @@ async fn find_missing_ranges(
         final_clause = final_clause
     );
 
+    info!(
+        "Executing gap detection query for table `{}` (ordering by `{}`).",
+        table, column
+    );
     let rows: Vec<GapRow> = client.query(&query).fetch_all().await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| (row.gap_start, row.gap_end))
-        .collect())
+    info!(
+        "Received {} gap candidate row(s) from table `{}`.",
+        rows.len(),
+        table
+    );
+    let mut ranges = Vec::with_capacity(rows.len());
+
+    for (idx, row) in rows.into_iter().enumerate() {
+        if row.gap_end < row.gap_start {
+            bail!(
+                "ClickHouse returned inverted gap range {}-{} for table `{}`",
+                row.gap_start,
+                row.gap_end,
+                table
+            );
+        }
+        ranges.push((row.gap_start, row.gap_end));
+        if (idx + 1) % 1_000 == 0 {
+            info!(
+                "Processed {} gap candidate row(s) from table `{}` so far.",
+                idx + 1,
+                table
+            );
+        }
+    }
+
+    Ok(ranges)
 }
 
 fn report_missing_ranges(ranges: &[(u64, u64)], context: &str) {
