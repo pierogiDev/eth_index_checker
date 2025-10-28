@@ -93,6 +93,41 @@ struct BlockDuplicateEntry {
     occurrences: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MutationState {
+    Pending,
+    Failed,
+    Finished,
+    Killed,
+}
+
+#[derive(Debug)]
+struct MutationInfo {
+    table: String,
+    mutation_id: String,
+    command: String,
+    create_time: String,
+    state: MutationState,
+    parts_remaining: Option<u64>,
+    parts_total: Option<u64>,
+    latest_failed_reason: Option<String>,
+}
+
+impl MutationState {
+    fn label(self) -> &'static str {
+        match self {
+            MutationState::Pending => "pending",
+            MutationState::Failed => "failed",
+            MutationState::Finished => "finished",
+            MutationState::Killed => "killed",
+        }
+    }
+
+    fn is_actionable(self) -> bool {
+        matches!(self, MutationState::Pending | MutationState::Failed)
+    }
+}
+
 #[derive(Debug, Clone)]
 struct TableMetadata {
     engine: Option<String>,
@@ -105,6 +140,7 @@ struct SelectedChecks {
     tx_gap: bool,
     tx_mismatch: bool,
     duplicates: bool,
+    mutation_cleanup: bool,
 }
 
 #[tokio::main]
@@ -363,6 +399,10 @@ async fn main() -> Result<()> {
                 );
             }
         }
+    }
+
+    if checks.mutation_cleanup {
+        cleanup_mutations(&client, &args).await?;
     }
 
     Ok(())
@@ -755,6 +795,391 @@ where
     Ok(mismatches)
 }
 
+async fn cleanup_mutations(client: &Client, args: &Args) -> Result<()> {
+    println!(
+        "Inspecting ClickHouse mutations for `{}` and `{}`...",
+        args.blocks_table, args.transactions_table
+    );
+
+    let mut tables = Vec::new();
+    tables.push(args.blocks_table.clone());
+    if args.transactions_table != args.blocks_table {
+        tables.push(args.transactions_table.clone());
+    }
+
+    let mutations = fetch_mutation_info(client, &tables).await?;
+
+    if mutations.is_empty() {
+        println!("No unfinished or failed mutations found for the target tables.");
+        return Ok(());
+    }
+
+    println!(
+        "Detected {} mutation(s) for the target tables:",
+        mutations.len()
+    );
+    for (idx, info) in mutations.iter().enumerate() {
+        println!(
+            "  {}. [{}] mutation {} on `{}` (created {})",
+            idx + 1,
+            info.state.label(),
+            info.mutation_id,
+            info.table,
+            info.create_time
+        );
+
+        if let Some(parts_total) = info.parts_total {
+            match info.parts_remaining {
+                Some(remaining) => {
+                    println!(
+                        "       parts remaining: {} / total: {}",
+                        remaining, parts_total
+                    );
+                }
+                None => {
+                    println!("       parts total: {}", parts_total);
+                }
+            }
+        }
+
+        if let Some(reason) = &info.latest_failed_reason {
+            if !reason.trim().is_empty() {
+                println!("       last failure: {}", reason);
+            }
+        }
+
+        println!("       command: {}", summarize_command(&info.command));
+    }
+
+    let actionable: Vec<&MutationInfo> = mutations
+        .iter()
+        .filter(|info| info.state.is_actionable())
+        .collect();
+
+    if !actionable.is_empty() {
+        println!(
+            "{} mutation(s) remain pending or failed. Consider shrinking their scope with smaller DELETE batches or wait for ClickHouse to finish them.",
+            actionable.len()
+        );
+    }
+
+    let mut target_tables: Vec<(String, String)> = Vec::new();
+    target_tables.push((args.blocks_table.clone(), args.blocks_number_column.clone()));
+    if !target_tables.iter().any(|(table, column)| {
+        table == &args.transactions_table && column == &args.transactions_block_column
+    }) {
+        target_tables.push((
+            args.transactions_table.clone(),
+            args.transactions_block_column.clone(),
+        ));
+    }
+
+    for (table, column) in &target_tables {
+        let prompt = format!(
+            "Queue targeted `ALTER TABLE {table} DELETE WHERE {column} ...` operations now?"
+        );
+        if prompt_yes_no(&prompt)? {
+            run_targeted_deletes(client, table, column).await?;
+        }
+    }
+
+    for table in tables {
+        if prompt_yes_no(&format!("Run `OPTIMIZE TABLE {} FINAL` now?", table))? {
+            optimize_table(client, &table).await?;
+            println!("  OPTIMIZE TABLE {} FINAL issued.", table);
+        }
+    }
+
+    Ok(())
+}
+
+async fn fetch_mutation_info(client: &Client, tables: &[String]) -> Result<Vec<MutationInfo>> {
+    if tables.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let table_filter = tables
+        .iter()
+        .map(|table| format!("'{}'", table.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct RawMutationRow {
+        table: String,
+        mutation_id: String,
+        command: String,
+        create_time: String,
+        is_done: u8,
+        is_killed: u8,
+        latest_failed_part: Option<String>,
+        latest_failed_part_why: Option<String>,
+        parts_to_do: Option<u64>,
+        parts_done: Option<u64>,
+    }
+
+    let query = format!(
+        "SELECT \
+            table, \
+            mutation_id, \
+            command, \
+            toString(create_time) AS create_time, \
+            is_done, \
+            is_killed, \
+            latest_failed_part, \
+            latest_failed_part_why, \
+            parts_to_do, \
+            parts_done \
+         FROM system.mutations \
+         WHERE database = currentDatabase() \
+           AND table IN ({}) \
+           AND (is_done = 0 OR is_killed = 1 OR latest_failed_part != '') \
+         ORDER BY create_time",
+        table_filter
+    );
+
+    let rows: Vec<RawMutationRow> = client.query(&query).fetch_all().await?;
+    let mut result = Vec::with_capacity(rows.len());
+
+    for row in rows {
+        let state = if row.is_killed != 0 {
+            MutationState::Killed
+        } else if row.is_done != 0 {
+            MutationState::Finished
+        } else if row
+            .latest_failed_part
+            .as_ref()
+            .map(|part| !part.is_empty())
+            .unwrap_or(false)
+        {
+            MutationState::Failed
+        } else {
+            MutationState::Pending
+        };
+
+        let parts_remaining = match (row.parts_to_do, row.parts_done) {
+            (Some(todo), Some(done)) => Some(todo.saturating_sub(done)),
+            (Some(todo), None) => Some(todo),
+            _ => None,
+        };
+
+        let latest_failed_reason = row.latest_failed_part_why.and_then(|why| {
+            if why.trim().is_empty() {
+                None
+            } else {
+                Some(why)
+            }
+        });
+
+        result.push(MutationInfo {
+            table: row.table,
+            mutation_id: row.mutation_id,
+            command: row.command,
+            create_time: row.create_time,
+            state,
+            parts_remaining,
+            parts_total: row.parts_to_do,
+            latest_failed_reason,
+        });
+    }
+
+    Ok(result)
+}
+
+async fn optimize_table(client: &Client, table: &str) -> Result<()> {
+    let query = format!("OPTIMIZE TABLE {} FINAL", table);
+
+    client
+        .query(&query)
+        .execute()
+        .await
+        .with_context(|| format!("Failed to optimize table `{}`", table))?;
+
+    Ok(())
+}
+
+async fn run_targeted_deletes(client: &Client, table: &str, column: &str) -> Result<()> {
+    println!(
+        "Provide block numbers or ranges to delete from `{}` (column `{}`).",
+        table, column
+    );
+    println!("  Format: use `12345` or `12340-12350`, separated by commas.");
+
+    let mut executed = false;
+
+    loop {
+        let prompt = format!(
+            "Enter block numbers/ranges for `{}` (empty to finish): ",
+            table
+        );
+        let ranges = prompt_block_ranges(&prompt)?;
+
+        if ranges.is_empty() {
+            if executed {
+                println!(
+                    "  No additional ranges provided. Finishing for `{}`.",
+                    table
+                );
+            } else {
+                println!(
+                    "  No ranges provided. Skipping targeted DELETE for `{}`.",
+                    table
+                );
+            }
+            break;
+        }
+
+        for (start, end) in ranges {
+            submit_delete_range(client, table, column, start, end).await?;
+            executed = true;
+        }
+
+        if !prompt_yes_no("Queue more ranges for this table?")? {
+            break;
+        }
+    }
+
+    Ok(())
+}
+
+fn prompt_block_ranges(prompt: &str) -> Result<Vec<(u64, u64)>> {
+    print!("{}", prompt);
+    io::stdout().flush().context("Failed to flush stdout")?;
+
+    let mut input = String::new();
+    let read = io::stdin()
+        .read_line(&mut input)
+        .context("Failed to read block range input")?;
+
+    if read == 0 || input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    parse_block_ranges(&input)
+}
+
+fn parse_block_ranges(input: &str) -> Result<Vec<(u64, u64)>> {
+    let mut ranges = Vec::new();
+
+    for token in input.split(',') {
+        let trimmed = token.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let (start, end) = if let Some((start_str, end_str)) = trimmed.split_once('-') {
+            let start: u64 = start_str
+                .trim()
+                .parse()
+                .with_context(|| format!("Invalid block number `{}`", start_str.trim()))?;
+            let end: u64 = end_str
+                .trim()
+                .parse()
+                .with_context(|| format!("Invalid block number `{}`", end_str.trim()))?;
+            if start > end {
+                bail!("Block range {}-{} is inverted", start, end);
+            }
+            (start, end)
+        } else {
+            let value: u64 = trimmed
+                .parse()
+                .with_context(|| format!("Invalid block number `{}`", trimmed))?;
+            (value, value)
+        };
+
+        ranges.push((start, end));
+    }
+
+    ranges.sort_by_key(|(start, _)| *start);
+
+    Ok(ranges)
+}
+
+async fn submit_delete_range(
+    client: &Client,
+    table: &str,
+    column: &str,
+    start: u64,
+    end: u64,
+) -> Result<()> {
+    let condition = if start == end {
+        format!("{} = {}", column, start)
+    } else {
+        format!("{} BETWEEN {} AND {}", column, start, end)
+    };
+
+    println!(
+        "  Executing ALTER TABLE {} DELETE WHERE {} (synchronous)...",
+        table, condition
+    );
+
+    let query = format!(
+        "ALTER TABLE {} DELETE WHERE {} SETTINGS mutations_sync = 1",
+        table, condition
+    );
+
+    client.query(&query).execute().await.with_context(|| {
+        format!(
+            "Failed to execute DELETE on `{}` for block range {}-{}",
+            table, start, end
+        )
+    })?;
+
+    println!(
+        "    Completed deletion for range {}-{} on `{}`.",
+        start, end, table
+    );
+
+    Ok(())
+}
+
+fn summarize_command(command: &str) -> String {
+    let condensed = command
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if condensed.is_empty() {
+        return "(empty command)".to_string();
+    }
+
+    const MAX_LEN: usize = 160;
+    if condensed.chars().count() > MAX_LEN {
+        let truncated = condensed.chars().take(MAX_LEN - 3).collect::<String>();
+        format!("{}...", truncated)
+    } else {
+        condensed
+    }
+}
+
+fn prompt_yes_no(question: &str) -> Result<bool> {
+    loop {
+        print!("{} [y/N]: ", question);
+        io::stdout().flush().context("Failed to flush stdout")?;
+
+        let mut input = String::new();
+        let read = io::stdin()
+            .read_line(&mut input)
+            .context("Failed to read response from stdin")?;
+
+        if read == 0 {
+            return Ok(false);
+        }
+
+        let trimmed = input.trim().to_lowercase();
+        if trimmed.is_empty() || trimmed == "n" || trimmed == "no" {
+            return Ok(false);
+        }
+        if trimmed == "y" || trimmed == "yes" {
+            return Ok(true);
+        }
+
+        println!("Please answer with `y` or `n`.");
+    }
+}
+
 async fn fetch_table_columns(client: &Client, table: &str) -> Result<Vec<ColumnInfo>> {
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct RawColumn {
@@ -842,6 +1267,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
     println!("  2) Transaction mismatch detection");
     println!("  3) Duplicate block detection");
     println!("  4) Transaction table gap detection");
+    println!("  5) Mutation cleanup (system.mutations / KILL MUTATION)");
     println!("Enter numbers separated by commas (e.g. `1,3`) or press Enter for all:");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
@@ -856,6 +1282,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         tx_gap: false,
         tx_mismatch: false,
         duplicates: false,
+        mutation_cleanup: false,
     };
 
     if read == 0 || input.trim().is_empty() {
@@ -863,6 +1290,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         selection.tx_gap = true;
         selection.tx_mismatch = true;
         selection.duplicates = true;
+        selection.mutation_cleanup = true;
         return Ok(selection);
     }
 
@@ -884,11 +1312,15 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
             "4" | "tx_gap" | "transaction_gap" | "transactions_gap" | "transactions_block_gap" => {
                 selection.tx_gap = true;
             }
+            "5" | "mutation" | "mutations" | "cleanup" | "mutation_cleanup" => {
+                selection.mutation_cleanup = true;
+            }
             "all" | "a" => {
                 selection.block_gap = true;
                 selection.tx_gap = true;
                 selection.tx_mismatch = true;
                 selection.duplicates = true;
+                selection.mutation_cleanup = true;
             }
             other => {
                 bail!("Unknown selection: `{}`", other);
@@ -896,7 +1328,11 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         }
     }
 
-    if !selection.block_gap && !selection.tx_gap && !selection.tx_mismatch && !selection.duplicates
+    if !selection.block_gap
+        && !selection.tx_gap
+        && !selection.tx_mismatch
+        && !selection.duplicates
+        && !selection.mutation_cleanup
     {
         bail!("No checks selected.");
     }
