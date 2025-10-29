@@ -7,6 +7,7 @@ ClickHouse に保存された Ethereum のブロック／トランザクショ�
 - ブロック番号の連続性をチェックして欠番を報告
 - ClickHouse に格納されたトランザクション件数と Ethereum ノードの実数を照合
 - 実行開始時に対象テーブルのカラム一覧を表示し、設定ミスを早期発見
+- ブロック欠損検出時に、対話的に補完実行の可否を選択可能
 
 照合作業では [alloy](https://crates.io/crates/alloy) を用いて `eth_getBlockTransactionCountByNumber` を呼び出します。
 
