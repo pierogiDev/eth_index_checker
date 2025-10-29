@@ -919,12 +919,40 @@ async fn cleanup_mutations(client: &Client, args: &Args) -> Result<()> {
         ));
     }
 
+    let mut block_delete_ranges: Vec<(u64, u64)> = Vec::new();
+
     for (table, column) in &target_tables {
+        let is_blocks_target = table == &args.blocks_table && column == &args.blocks_number_column;
+        let is_transactions_target =
+            table == &args.transactions_table && column == &args.transactions_block_column;
+
+        if is_transactions_target && !block_delete_ranges.is_empty() {
+            let reuse_prompt = format!(
+                "Reuse the previously submitted block ranges from `{}` for `{}` (column `{}`)?",
+                args.blocks_table, table, column
+            );
+            if prompt_yes_no(&reuse_prompt)? {
+                println!(
+                    "  Applying previously executed ranges from `{}` to `{}`.",
+                    args.blocks_table, table
+                );
+                apply_delete_ranges(client, table, column, &block_delete_ranges).await?;
+
+                if prompt_yes_no("Queue additional ranges for this table?")? {
+                    run_targeted_deletes(client, table, column).await?;
+                }
+                continue;
+            }
+        }
+
         let prompt = format!(
             "Queue targeted `ALTER TABLE {table} DELETE WHERE {column} ...` operations now?"
         );
         if prompt_yes_no(&prompt)? {
-            run_targeted_deletes(client, table, column).await?;
+            let executed = run_targeted_deletes(client, table, column).await?;
+            if is_blocks_target {
+                block_delete_ranges = executed;
+            }
         }
     }
 
@@ -950,6 +978,40 @@ async fn fetch_mutation_info(client: &Client, tables: &[String]) -> Result<Vec<M
         .join(", ");
 
     #[derive(clickhouse::Row, serde::Deserialize)]
+    struct ColumnNameRow {
+        name: String,
+    }
+
+    let columns_query = "\
+        SELECT name \
+        FROM system.columns \
+        WHERE database = 'system' \
+          AND table = 'mutations' \
+          AND name IN ('parts_done', 'latest_failed_part_why')";
+
+    let column_rows: Vec<ColumnNameRow> = client.query(columns_query).fetch_all().await?;
+
+    // Older ClickHouse releases (< v26) lack `parts_done`/`latest_failed_part_why`; fall back to NULL.
+    let has_parts_done = column_rows.iter().any(|row| row.name == "parts_done");
+    let has_latest_failed_part_why = column_rows
+        .iter()
+        .any(|row| row.name == "latest_failed_part_why");
+
+    let parts_done_select = if has_parts_done {
+        "CAST(parts_done, 'Nullable(UInt64)') AS parts_done".to_string()
+    } else {
+        "CAST(NULL, 'Nullable(UInt64)') AS parts_done".to_string()
+    };
+    let latest_failed_part_why_select = if has_latest_failed_part_why {
+        "latest_failed_part_why".to_string()
+    } else {
+        "CAST(NULL, 'Nullable(String)') AS latest_failed_part_why".to_string()
+    };
+    let latest_failed_part_select =
+        "CAST(latest_failed_part, 'Nullable(String)') AS latest_failed_part";
+    let parts_to_do_select = "CAST(parts_to_do, 'Nullable(UInt64)') AS parts_to_do";
+
+    #[derive(clickhouse::Row, serde::Deserialize)]
     struct RawMutationRow {
         table: String,
         mutation_id: String,
@@ -971,16 +1033,20 @@ async fn fetch_mutation_info(client: &Client, tables: &[String]) -> Result<Vec<M
             toString(create_time) AS create_time, \
             is_done, \
             is_killed, \
-            latest_failed_part, \
-            latest_failed_part_why, \
-            parts_to_do, \
-            parts_done \
+            {latest_failed_part_select}, \
+            {latest_failed_part_why_select}, \
+            {parts_to_do_select}, \
+            {parts_done_select} \
          FROM system.mutations \
          WHERE database = currentDatabase() \
-           AND table IN ({}) \
+           AND table IN ({table_filter}) \
            AND (is_done = 0 OR is_killed = 1 OR latest_failed_part != '') \
          ORDER BY create_time",
-        table_filter
+        table_filter = table_filter,
+        parts_done_select = parts_done_select,
+        latest_failed_part_why_select = latest_failed_part_why_select,
+        latest_failed_part_select = latest_failed_part_select,
+        parts_to_do_select = parts_to_do_select
     );
 
     let rows: Vec<RawMutationRow> = client.query(&query).fetch_all().await?;
@@ -1043,14 +1109,18 @@ async fn optimize_table(client: &Client, table: &str) -> Result<()> {
     Ok(())
 }
 
-async fn run_targeted_deletes(client: &Client, table: &str, column: &str) -> Result<()> {
+async fn run_targeted_deletes(
+    client: &Client,
+    table: &str,
+    column: &str,
+) -> Result<Vec<(u64, u64)>> {
     println!(
         "Provide block numbers or ranges to delete from `{}` (column `{}`).",
         table, column
     );
     println!("  Format: use `12345` or `12340-12350`, separated by commas.");
 
-    let mut executed = false;
+    let mut executed_ranges: Vec<(u64, u64)> = Vec::new();
 
     loop {
         let prompt = format!(
@@ -1060,28 +1130,41 @@ async fn run_targeted_deletes(client: &Client, table: &str, column: &str) -> Res
         let ranges = prompt_block_ranges(&prompt)?;
 
         if ranges.is_empty() {
-            if executed {
+            if executed_ranges.is_empty() {
                 println!(
-                    "  No additional ranges provided. Finishing for `{}`.",
+                    "  No ranges provided. Skipping targeted DELETE for `{}`.",
                     table
                 );
             } else {
                 println!(
-                    "  No ranges provided. Skipping targeted DELETE for `{}`.",
+                    "  No additional ranges provided. Finishing for `{}`.",
                     table
                 );
             }
             break;
         }
 
-        for (start, end) in ranges {
+        for &(start, end) in &ranges {
             submit_delete_range(client, table, column, start, end).await?;
-            executed = true;
+            executed_ranges.push((start, end));
         }
 
         if !prompt_yes_no("Queue more ranges for this table?")? {
             break;
         }
+    }
+
+    Ok(executed_ranges)
+}
+
+async fn apply_delete_ranges(
+    client: &Client,
+    table: &str,
+    column: &str,
+    ranges: &[(u64, u64)],
+) -> Result<()> {
+    for &(start, end) in ranges {
+        submit_delete_range(client, table, column, start, end).await?;
     }
 
     Ok(())
