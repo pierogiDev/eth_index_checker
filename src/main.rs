@@ -1,14 +1,10 @@
 use alloy::eips::BlockNumberOrTag;
-use alloy::hex;
-use alloy::primitives::U256;
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
-use clickhouse::query::Query;
 use clickhouse::Client;
-use log::{info, warn};
+use log::info;
 use reqwest::Url;
-use serde_json::{Map, Value};
 use std::io::{self, Write};
 
 const DEFAULT_CLICKHOUSE_ADDRESS: &str = env!("CLICKHOUSE_ADDRESS");
@@ -145,6 +141,8 @@ struct SelectedChecks {
     tx_mismatch: bool,
     duplicates: bool,
     mutations: bool,
+    optimize_blocks: bool,
+    optimize_transactions: bool,
 }
 
 #[tokio::main]
@@ -435,6 +433,14 @@ async fn main() -> Result<()> {
 
     if checks.mutations {
         cleanup_mutations(&client, &args).await?;
+    }
+
+    if checks.optimize_blocks {
+        optimize_blocks_table(&client, &args).await?;
+    }
+
+    if checks.optimize_transactions {
+        optimize_transactions_table(&client, &args).await?;
     }
 
     Ok(())
@@ -919,47 +925,17 @@ async fn cleanup_mutations(client: &Client, args: &Args) -> Result<()> {
         ));
     }
 
-    let mut block_delete_ranges: Vec<(u64, u64)> = Vec::new();
-
     for (table, column) in &target_tables {
-        let is_blocks_target = table == &args.blocks_table && column == &args.blocks_number_column;
-        let is_transactions_target =
-            table == &args.transactions_table && column == &args.transactions_block_column;
-
-        if is_transactions_target && !block_delete_ranges.is_empty() {
-            let reuse_prompt = format!(
-                "Reuse the previously submitted block ranges from `{}` for `{}` (column `{}`)?",
-                args.blocks_table, table, column
-            );
-            if prompt_yes_no(&reuse_prompt)? {
-                println!(
-                    "  Applying previously executed ranges from `{}` to `{}`.",
-                    args.blocks_table, table
-                );
-                apply_delete_ranges(client, table, column, &block_delete_ranges).await?;
-
-                if prompt_yes_no("Queue additional ranges for this table?")? {
-                    run_targeted_deletes(client, table, column).await?;
-                }
-                continue;
-            }
-        }
-
-        let prompt = format!(
-            "Queue targeted `ALTER TABLE {table} DELETE WHERE {column} ...` operations now?"
-        );
-        if prompt_yes_no(&prompt)? {
-            let executed = run_targeted_deletes(client, table, column).await?;
-            if is_blocks_target {
-                block_delete_ranges = executed;
-            }
-        }
+        run_targeted_deletes(client, table, column).await?;
     }
 
     for table in tables {
         if prompt_yes_no(&format!("Run `OPTIMIZE TABLE {} FINAL` now?", table))? {
             optimize_table(client, &table).await?;
-            println!("  OPTIMIZE TABLE {} FINAL issued.", table);
+            println!(
+                "  読み取り専用モードのため、`OPTIMIZE TABLE {} FINAL` は実行されませんでした。",
+                table
+            );
         }
     }
 
@@ -1097,168 +1073,64 @@ async fn fetch_mutation_info(client: &Client, tables: &[String]) -> Result<Vec<M
     Ok(result)
 }
 
-async fn optimize_table(client: &Client, table: &str) -> Result<()> {
-    let query = format!("OPTIMIZE TABLE {} FINAL", table);
+async fn optimize_table(_client: &Client, table: &str) -> Result<()> {
+    info!(
+        "読み取り専用モードのため、`OPTIMIZE TABLE {} FINAL` を実行しません。",
+        table
+    );
+    Ok(())
+}
 
-    client
-        .query(&query)
-        .execute()
-        .await
-        .with_context(|| format!("Failed to optimize table `{}`", table))?;
+async fn optimize_blocks_table(client: &Client, args: &Args) -> Result<()> {
+    println!(
+        "ブロックテーブル `{}` に対して `OPTIMIZE TABLE ... FINAL` を発行します。",
+        args.blocks_table
+    );
+    let query = format!("OPTIMIZE TABLE {} FINAL", args.blocks_table);
+    info!("Issuing `{}` against ClickHouse.", query);
+    client.query(&query).execute().await.with_context(|| {
+        format!(
+            "Failed to optimize blocks table `{}` via `OPTIMIZE TABLE ... FINAL`",
+            args.blocks_table
+        )
+    })?;
+    println!(
+        "`OPTIMIZE TABLE {} FINAL` を送信しました。ClickHouse側の処理完了を確認してください。",
+        args.blocks_table
+    );
+    Ok(())
+}
 
+async fn optimize_transactions_table(client: &Client, args: &Args) -> Result<()> {
+    println!(
+        "トランザクションテーブル `{}` に対して `OPTIMIZE TABLE ... FINAL` を発行します。",
+        args.transactions_table
+    );
+    let query = format!("OPTIMIZE TABLE {} FINAL", args.transactions_table);
+    info!("Issuing `{}` against ClickHouse.", query);
+    client.query(&query).execute().await.with_context(|| {
+        format!(
+            "Failed to optimize transactions table `{}` via `OPTIMIZE TABLE ... FINAL`",
+            args.transactions_table
+        )
+    })?;
+    println!(
+        "`OPTIMIZE TABLE {} FINAL` を送信しました。ClickHouse側の処理完了を確認してください。",
+        args.transactions_table
+    );
     Ok(())
 }
 
 async fn run_targeted_deletes(
-    client: &Client,
+    _client: &Client,
     table: &str,
-    column: &str,
+    _column: &str,
 ) -> Result<Vec<(u64, u64)>> {
     println!(
-        "Provide block numbers or ranges to delete from `{}` (column `{}`).",
-        table, column
+        "読み取り専用モードのため、テーブル `{}` に対する DELETE キューイングはスキップします。",
+        table
     );
-    println!("  Format: use `12345` or `12340-12350`, separated by commas.");
-
-    let mut executed_ranges: Vec<(u64, u64)> = Vec::new();
-
-    loop {
-        let prompt = format!(
-            "Enter block numbers/ranges for `{}` (empty to finish): ",
-            table
-        );
-        let ranges = prompt_block_ranges(&prompt)?;
-
-        if ranges.is_empty() {
-            if executed_ranges.is_empty() {
-                println!(
-                    "  No ranges provided. Skipping targeted DELETE for `{}`.",
-                    table
-                );
-            } else {
-                println!(
-                    "  No additional ranges provided. Finishing for `{}`.",
-                    table
-                );
-            }
-            break;
-        }
-
-        for &(start, end) in &ranges {
-            submit_delete_range(client, table, column, start, end).await?;
-            executed_ranges.push((start, end));
-        }
-
-        if !prompt_yes_no("Queue more ranges for this table?")? {
-            break;
-        }
-    }
-
-    Ok(executed_ranges)
-}
-
-async fn apply_delete_ranges(
-    client: &Client,
-    table: &str,
-    column: &str,
-    ranges: &[(u64, u64)],
-) -> Result<()> {
-    for &(start, end) in ranges {
-        submit_delete_range(client, table, column, start, end).await?;
-    }
-
-    Ok(())
-}
-
-fn prompt_block_ranges(prompt: &str) -> Result<Vec<(u64, u64)>> {
-    print!("{}", prompt);
-    io::stdout().flush().context("Failed to flush stdout")?;
-
-    let mut input = String::new();
-    let read = io::stdin()
-        .read_line(&mut input)
-        .context("Failed to read block range input")?;
-
-    if read == 0 || input.trim().is_empty() {
-        return Ok(Vec::new());
-    }
-
-    parse_block_ranges(&input)
-}
-
-fn parse_block_ranges(input: &str) -> Result<Vec<(u64, u64)>> {
-    let mut ranges = Vec::new();
-
-    for token in input.split(',') {
-        let trimmed = token.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let (start, end) = if let Some((start_str, end_str)) = trimmed.split_once('-') {
-            let start: u64 = start_str
-                .trim()
-                .parse()
-                .with_context(|| format!("Invalid block number `{}`", start_str.trim()))?;
-            let end: u64 = end_str
-                .trim()
-                .parse()
-                .with_context(|| format!("Invalid block number `{}`", end_str.trim()))?;
-            if start > end {
-                bail!("Block range {}-{} is inverted", start, end);
-            }
-            (start, end)
-        } else {
-            let value: u64 = trimmed
-                .parse()
-                .with_context(|| format!("Invalid block number `{}`", trimmed))?;
-            (value, value)
-        };
-
-        ranges.push((start, end));
-    }
-
-    ranges.sort_by_key(|(start, _)| *start);
-
-    Ok(ranges)
-}
-
-async fn submit_delete_range(
-    client: &Client,
-    table: &str,
-    column: &str,
-    start: u64,
-    end: u64,
-) -> Result<()> {
-    let condition = if start == end {
-        format!("{} = {}", column, start)
-    } else {
-        format!("{} BETWEEN {} AND {}", column, start, end)
-    };
-
-    println!(
-        "  Executing ALTER TABLE {} DELETE WHERE {} (synchronous)...",
-        table, condition
-    );
-
-    let query = format!(
-        "ALTER TABLE {} DELETE WHERE {} SETTINGS mutations_sync = 1",
-        table, condition
-    );
-
-    client.query(&query).execute().await.with_context(|| {
-        format!(
-            "Failed to execute DELETE on `{}` for block range {}-{}",
-            table, start, end
-        )
-    })?;
-
-    println!(
-        "    Completed deletion for range {}-{} on `{}`.",
-        start, end, table
-    );
-
-    Ok(())
+    Ok(Vec::new())
 }
 
 fn summarize_command(command: &str) -> String {
@@ -1332,73 +1204,6 @@ async fn fetch_table_columns(client: &Client, table: &str) -> Result<Vec<ColumnI
             column_type: row.column_type,
         })
         .collect())
-}
-
-#[derive(Debug, Clone)]
-struct ColumnValue {
-    name: String,
-    value: QueryValue,
-}
-
-#[derive(Debug, Clone)]
-enum QueryValue {
-    UInt64(u64),
-    NullableUInt64(Option<u64>),
-    Int64(i64),
-    NullableInt64(Option<i64>),
-    Float64(f64),
-    NullableFloat64(Option<f64>),
-    String(String),
-    NullableString(Option<String>),
-    Bool(bool),
-    NullableBool(Option<bool>),
-    Bytes(Vec<u8>),
-    NullableBytes(Option<Vec<u8>>),
-    ArrayString(Vec<String>),
-    NullableArrayString(Option<Vec<String>>),
-}
-
-impl QueryValue {
-    fn bind(self, query: Query) -> Query {
-        match self {
-            QueryValue::UInt64(v) => query.bind(v),
-            QueryValue::NullableUInt64(v) => query.bind(v),
-            QueryValue::Int64(v) => query.bind(v),
-            QueryValue::NullableInt64(v) => query.bind(v),
-            QueryValue::Float64(v) => query.bind(v),
-            QueryValue::NullableFloat64(v) => query.bind(v),
-            QueryValue::String(v) => query.bind(v),
-            QueryValue::NullableString(v) => query.bind(v),
-            QueryValue::Bool(v) => query.bind(v),
-            QueryValue::NullableBool(v) => query.bind(v),
-            QueryValue::Bytes(v) => query.bind(v),
-            QueryValue::NullableBytes(v) => query.bind(v),
-            QueryValue::ArrayString(v) => query.bind(v),
-            QueryValue::NullableArrayString(v) => query.bind(v),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ColumnTypeInfo {
-    base: BaseType,
-    nullable: bool,
-}
-
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-enum BaseType {
-    UInt(u16),
-    Int(u16),
-    Float(u8),
-    String,
-    FixedString(usize),
-    Bool,
-    DateTime,
-    DateTime64(u32),
-    ArrayString,
-    Decimal { precision: u32, scale: u32 },
-    Unknown(String),
 }
 
 fn ensure_provider<'a>(
@@ -1509,1042 +1314,24 @@ async fn repair_transaction_mismatches(
 }
 
 async fn fill_missing_blocks_and_transactions(
-    client: &Client,
-    provider: &impl Provider,
-    args: &Args,
-    block_columns: &[ColumnInfo],
-    tx_columns: &[ColumnInfo],
+    _client: &Client,
+    _provider: &impl Provider,
+    _args: &Args,
+    _block_columns: &[ColumnInfo],
+    _tx_columns: &[ColumnInfo],
     missing_ranges: &[(u64, u64)],
 ) -> Result<()> {
     if missing_ranges.is_empty() {
         return Ok(());
     }
 
-    let mut total_blocks = 0u64;
-    let mut total_transactions = 0u64;
-
-    for (start, end) in missing_ranges {
-        for block_number in *start..=*end {
-            info!("ブロック {} の補完を開始します。", block_number);
-            let response = provider
-                .get_block_by_number(BlockNumberOrTag::Number(block_number))
-                .full()
-                .await
-                .with_context(|| format!("ブロック {} の取得に失敗しました", block_number))?
-                .ok_or_else(|| {
-                    anyhow!(
-                        "Ethereumノードがブロック {} を返しませんでした",
-                        block_number
-                    )
-                })?;
-
-            if !response.transactions.is_full() {
-                bail!(
-                    "ブロック {} のトランザクション情報がハッシュのみで返却されました。",
-                    block_number
-                );
-            }
-
-            let block_json = serde_json::to_value(&response)
-                .context("ブロックレスポンスをJSONへ変換できませんでした")?;
-            let block_obj = block_json.as_object().ok_or_else(|| {
-                anyhow!(
-                    "ブロック {} のJSONがオブジェクトではありません",
-                    block_number
-                )
-            })?;
-
-            let tx_values = block_obj
-                .get("transactions")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-
-            let tx_entries: Vec<Map<String, Value>> = tx_values
-                .into_iter()
-                .filter_map(|value| match value {
-                    Value::Object(map) => Some(map),
-                    other => {
-                        warn!(
-                            "ブロック {} のトランザクション値がオブジェクトではありません: {:?}",
-                            block_number, other
-                        );
-                        None
-                    }
-                })
-                .collect();
-
-            let tx_count = tx_entries.len();
-            let block_row = build_block_row(block_columns, args, block_obj, block_number, tx_count)
-                .with_context(|| {
-                    format!("ブロック {} の行データ構築に失敗しました", block_number)
-                })?;
-
-            if block_row.is_empty() {
-                warn!(
-                    "ブロック {} に対応する挿入カラムが見つからず、INSERTをスキップします。",
-                    block_number
-                );
-            } else {
-                delete_block_row(client, args, block_number).await?;
-                insert_row(client, &args.blocks_table, &block_row)
-                    .await
-                    .with_context(|| format!("ブロック {} の挿入に失敗しました", block_number))?;
-            }
-
-            delete_transactions_for_block(client, args, block_number).await?;
-
-            let mut inserted_for_block = 0u64;
-            for tx_map in tx_entries {
-                let tx_row = build_transaction_row(tx_columns, args, &tx_map, block_number)
-                    .with_context(|| {
-                        format!(
-                            "ブロック {} のトランザクション行構築に失敗しました",
-                            block_number
-                        )
-                    })?;
-
-                if tx_row.is_empty() {
-                    let tx_hash = tx_map
-                        .get("hash")
-                        .and_then(Value::as_str)
-                        .map(|s| s.to_string())
-                        .unwrap_or_else(|| "<unknown>".to_string());
-                    warn!(
-                        "トランザクション {} の挿入対象カラムがなく、スキップしました。",
-                        tx_hash
-                    );
-                    continue;
-                }
-
-                insert_row(client, &args.transactions_table, &tx_row)
-                    .await
-                    .with_context(|| {
-                        let tx_hash = tx_map
-                            .get("hash")
-                            .and_then(Value::as_str)
-                            .unwrap_or("<unknown>");
-                        format!(
-                            "トランザクション {} (ブロック {}) の挿入に失敗しました",
-                            tx_hash, block_number
-                        )
-                    })?;
-                inserted_for_block += 1;
-            }
-
-            total_blocks += 1;
-            total_transactions += inserted_for_block;
-
-            println!(
-                "ブロック {} を補完しました (トランザクション {} 件)。",
-                block_number, inserted_for_block
-            );
-        }
-    }
-
     println!(
-        "補完完了: ブロック {} 件、トランザクション {} 件を挿入しました。",
-        total_blocks, total_transactions
+        "欠損範囲が {} 件見つかりましたが、読み取り専用モードのため補完処理をスキップします。",
+        missing_ranges.len()
     );
+    info!("欠損データ補完は無効化されています。");
 
     Ok(())
-}
-
-fn build_block_row(
-    block_columns: &[ColumnInfo],
-    args: &Args,
-    block_obj: &Map<String, Value>,
-    block_number: u64,
-    tx_count: usize,
-) -> Result<Vec<ColumnValue>> {
-    let mut row = Vec::new();
-
-    for column in block_columns {
-        let type_info = parse_column_type(&column.column_type);
-        let value = if column.name == args.blocks_number_column {
-            Some(build_number_from_u64(&type_info, block_number)?)
-        } else {
-            match column.name.as_str() {
-                "hash" => build_hex_value(&type_info, block_obj.get("hash"), "hash", "hash")?,
-                "parent_hash" => build_hex_value(
-                    &type_info,
-                    block_obj.get("parentHash"),
-                    "parentHash",
-                    "parent_hash",
-                )?,
-                "miner" | "coinbase" => build_string_value(
-                    &type_info,
-                    block_obj.get("miner"),
-                    "miner",
-                    column.name.as_str(),
-                )?,
-                "nonce" => build_hex_value(
-                    &type_info,
-                    block_obj.get("nonce"),
-                    "nonce",
-                    column.name.as_str(),
-                )?,
-                "sha3_uncles" => build_hex_value(
-                    &type_info,
-                    block_obj.get("sha3Uncles"),
-                    "sha3Uncles",
-                    column.name.as_str(),
-                )?,
-                "logs_bloom" => build_hex_value(
-                    &type_info,
-                    block_obj.get("logsBloom"),
-                    "logsBloom",
-                    column.name.as_str(),
-                )?,
-                "transactions_root" => build_hex_value(
-                    &type_info,
-                    block_obj.get("transactionsRoot"),
-                    "transactionsRoot",
-                    column.name.as_str(),
-                )?,
-                "state_root" => build_hex_value(
-                    &type_info,
-                    block_obj.get("stateRoot"),
-                    "stateRoot",
-                    column.name.as_str(),
-                )?,
-                "receipts_root" => build_hex_value(
-                    &type_info,
-                    block_obj.get("receiptsRoot"),
-                    "receiptsRoot",
-                    column.name.as_str(),
-                )?,
-                "mix_hash" => build_hex_value(
-                    &type_info,
-                    block_obj.get("mixHash"),
-                    "mixHash",
-                    column.name.as_str(),
-                )?,
-                "base_fee_per_gas" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("baseFeePerGas"),
-                    "baseFeePerGas",
-                    column.name.as_str(),
-                )?,
-                "blob_gas_used" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("blobGasUsed"),
-                    "blobGasUsed",
-                    column.name.as_str(),
-                )?,
-                "blob_gas_price" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("blobGasPrice"),
-                    "blobGasPrice",
-                    column.name.as_str(),
-                )?,
-                "difficulty" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("difficulty"),
-                    "difficulty",
-                    column.name.as_str(),
-                )?,
-                "total_difficulty" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("totalDifficulty"),
-                    "totalDifficulty",
-                    column.name.as_str(),
-                )?,
-                "size" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("size"),
-                    "size",
-                    column.name.as_str(),
-                )?,
-                "gas_limit" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("gasLimit"),
-                    "gasLimit",
-                    column.name.as_str(),
-                )?,
-                "gas_used" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("gasUsed"),
-                    "gasUsed",
-                    column.name.as_str(),
-                )?,
-                "timestamp" => build_numeric_value(
-                    &type_info,
-                    block_obj.get("timestamp"),
-                    "timestamp",
-                    column.name.as_str(),
-                )?,
-                "extra_data" => build_hex_value(
-                    &type_info,
-                    block_obj.get("extraData"),
-                    "extraData",
-                    column.name.as_str(),
-                )?,
-                "withdrawals_root" => build_hex_value(
-                    &type_info,
-                    block_obj.get("withdrawalsRoot"),
-                    "withdrawalsRoot",
-                    column.name.as_str(),
-                )?,
-                "parent_beacon_block_root" => build_hex_value(
-                    &type_info,
-                    block_obj.get("parentBeaconBlockRoot"),
-                    "parentBeaconBlockRoot",
-                    column.name.as_str(),
-                )?,
-                "transactions_count" | "tx_count" => {
-                    Some(build_number_from_u64(&type_info, tx_count as u64)?)
-                }
-                "withdrawals" => build_json_value(
-                    &type_info,
-                    block_obj.get("withdrawals"),
-                    column.name.as_str(),
-                )?,
-                "uncles" => {
-                    build_json_value(&type_info, block_obj.get("uncles"), column.name.as_str())?
-                }
-                _ => None,
-            }
-        };
-
-        if let Some(value) = value {
-            row.push(ColumnValue {
-                name: column.name.clone(),
-                value,
-            });
-        }
-    }
-
-    Ok(row)
-}
-
-fn build_transaction_row(
-    tx_columns: &[ColumnInfo],
-    args: &Args,
-    tx_obj: &Map<String, Value>,
-    block_number: u64,
-) -> Result<Vec<ColumnValue>> {
-    let mut row = Vec::new();
-
-    for column in tx_columns {
-        let type_info = parse_column_type(&column.column_type);
-        let value = if column.name == args.transactions_block_column {
-            Some(build_number_from_u64(&type_info, block_number)?)
-        } else {
-            match column.name.as_str() {
-                "hash" | "tx_hash" => {
-                    build_hex_value(&type_info, tx_obj.get("hash"), "hash", column.name.as_str())?
-                }
-                "block_hash" => build_hex_value(
-                    &type_info,
-                    tx_obj.get("blockHash"),
-                    "blockHash",
-                    column.name.as_str(),
-                )?,
-                "nonce" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("nonce"),
-                    "nonce",
-                    column.name.as_str(),
-                )?,
-                "transaction_index" | "tx_index" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("transactionIndex"),
-                    "transactionIndex",
-                    column.name.as_str(),
-                )?,
-                "from" | "from_address" => build_string_value(
-                    &type_info,
-                    tx_obj.get("from"),
-                    "from",
-                    column.name.as_str(),
-                )?,
-                "to" | "to_address" => {
-                    build_string_value(&type_info, tx_obj.get("to"), "to", column.name.as_str())?
-                }
-                "value" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("value"),
-                    "value",
-                    column.name.as_str(),
-                )?,
-                "gas" => {
-                    build_numeric_value(&type_info, tx_obj.get("gas"), "gas", column.name.as_str())?
-                }
-                "gas_price" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("gasPrice"),
-                    "gasPrice",
-                    column.name.as_str(),
-                )?,
-                "max_fee_per_gas" | "max_fee_per_gwei" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("maxFeePerGas"),
-                    "maxFeePerGas",
-                    column.name.as_str(),
-                )?,
-                "max_priority_fee_per_gas" | "priority_fee" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("maxPriorityFeePerGas"),
-                    "maxPriorityFeePerGas",
-                    column.name.as_str(),
-                )?,
-                "max_fee_per_blob_gas" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("maxFeePerBlobGas"),
-                    "maxFeePerBlobGas",
-                    column.name.as_str(),
-                )?,
-                "input" | "data" => build_hex_value(
-                    &type_info,
-                    tx_obj.get("input"),
-                    "input",
-                    column.name.as_str(),
-                )?,
-                "type" | "tx_type" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("type"),
-                    "type",
-                    column.name.as_str(),
-                )?,
-                "chain_id" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("chainId"),
-                    "chainId",
-                    column.name.as_str(),
-                )?,
-                "access_list" => {
-                    build_json_value(&type_info, tx_obj.get("accessList"), column.name.as_str())?
-                }
-                "blob_versioned_hashes" => build_json_value(
-                    &type_info,
-                    tx_obj.get("blobVersionedHashes"),
-                    column.name.as_str(),
-                )?,
-                "r" => build_numeric_value(&type_info, tx_obj.get("r"), "r", column.name.as_str())?,
-                "s" => build_numeric_value(&type_info, tx_obj.get("s"), "s", column.name.as_str())?,
-                "v" => build_numeric_value(&type_info, tx_obj.get("v"), "v", column.name.as_str())?,
-                "y_parity" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("yParity"),
-                    "yParity",
-                    column.name.as_str(),
-                )?,
-                "signature" => build_hex_value(
-                    &type_info,
-                    tx_obj.get("signature"),
-                    "signature",
-                    column.name.as_str(),
-                )?,
-                "l1_fee" => build_numeric_value(
-                    &type_info,
-                    tx_obj.get("l1Fee"),
-                    "l1Fee",
-                    column.name.as_str(),
-                )?,
-                _ => None,
-            }
-        };
-
-        if let Some(value) = value {
-            row.push(ColumnValue {
-                name: column.name.clone(),
-                value,
-            });
-        }
-    }
-
-    Ok(row)
-}
-
-async fn delete_block_row(client: &Client, args: &Args, block_number: u64) -> Result<()> {
-    let result = client
-        .query(&format!(
-            "ALTER TABLE {} DELETE WHERE {} = ?",
-            args.blocks_table, args.blocks_number_column
-        ))
-        .bind(block_number)
-        .execute()
-        .await;
-
-    if let Err(err) = result {
-        warn!(
-            "ブロック {} の既存データ削除に失敗しました (継続します): {}",
-            block_number, err
-        );
-    }
-
-    Ok(())
-}
-
-async fn delete_transactions_for_block(
-    client: &Client,
-    args: &Args,
-    block_number: u64,
-) -> Result<()> {
-    let result = client
-        .query(&format!(
-            "ALTER TABLE {} DELETE WHERE {} = ?",
-            args.transactions_table, args.transactions_block_column
-        ))
-        .bind(block_number)
-        .execute()
-        .await;
-
-    if let Err(err) = result {
-        warn!(
-            "ブロック {} の既存トランザクション削除に失敗しました (継続します): {}",
-            block_number, err
-        );
-    }
-
-    Ok(())
-}
-
-async fn insert_row(client: &Client, table: &str, row: &[ColumnValue]) -> Result<()> {
-    if row.is_empty() {
-        return Ok(());
-    }
-
-    let column_names = row
-        .iter()
-        .map(|col| col.name.as_str())
-        .collect::<Vec<_>>()
-        .join(", ");
-    let placeholders = vec!["?"; row.len()].join(", ");
-
-    let mut query = client.query(&format!(
-        "INSERT INTO {} ({}) VALUES ({})",
-        table, column_names, placeholders
-    ));
-
-    for column in row {
-        query = column.value.clone().bind(query);
-    }
-
-    query.execute().await?;
-    Ok(())
-}
-
-fn parse_column_type(raw: &str) -> ColumnTypeInfo {
-    let mut nullable = false;
-    let mut ty = raw.trim();
-
-    loop {
-        if let Some(stripped) = ty.strip_prefix("Nullable(") {
-            if let Some(inner) = stripped.strip_suffix(')') {
-                nullable = true;
-                ty = inner.trim();
-                continue;
-            }
-        }
-        if let Some(stripped) = ty.strip_prefix("LowCardinality(") {
-            if let Some(inner) = stripped.strip_suffix(')') {
-                ty = inner.trim();
-                continue;
-            }
-        }
-        if let Some(stripped) = ty.strip_prefix("SimpleAggregateFunction(") {
-            if let Some(inner) = stripped.strip_suffix(')') {
-                if let Some(pos) = inner.rfind(',') {
-                    ty = inner[pos + 1..].trim();
-                    continue;
-                }
-            }
-        }
-        break;
-    }
-
-    ColumnTypeInfo {
-        base: parse_base_type(ty),
-        nullable,
-    }
-}
-
-fn parse_base_type(base: &str) -> BaseType {
-    match base {
-        "String" => BaseType::String,
-        "Bool" | "Boolean" => BaseType::Bool,
-        "DateTime" => BaseType::DateTime,
-        "Float32" => BaseType::Float(32),
-        "Float64" => BaseType::Float(64),
-        "UUID" => BaseType::FixedString(16),
-        _ if base.starts_with("FixedString(") && base.ends_with(')') => {
-            let inner = &base["FixedString(".len()..base.len() - 1];
-            let len = inner.parse::<usize>().unwrap_or(0);
-            BaseType::FixedString(len)
-        }
-        _ if base == "Array(String)" => BaseType::ArrayString,
-        _ if base.starts_with("DateTime64(") && base.ends_with(')') => {
-            let inner = &base["DateTime64(".len()..base.len() - 1];
-            let scale = inner.parse::<u32>().unwrap_or(0);
-            BaseType::DateTime64(scale)
-        }
-        _ if base.starts_with("Decimal(") && base.ends_with(')') => {
-            let inner = &base["Decimal(".len()..base.len() - 1];
-            let mut parts = inner.split(',').map(|p| p.trim());
-            if let (Some(precision), Some(scale)) = (parts.next(), parts.next()) {
-                if let (Ok(p), Ok(s)) = (precision.parse::<u32>(), scale.parse::<u32>()) {
-                    return BaseType::Decimal {
-                        precision: p,
-                        scale: s,
-                    };
-                }
-            }
-            BaseType::Decimal {
-                precision: 0,
-                scale: 0,
-            }
-        }
-        _ if base.starts_with("Decimal32(") && base.ends_with(')') => {
-            let inner = &base["Decimal32(".len()..base.len() - 1];
-            let scale = inner.parse::<u32>().unwrap_or(0);
-            BaseType::Decimal {
-                precision: 9,
-                scale,
-            }
-        }
-        _ if base.starts_with("Decimal64(") && base.ends_with(')') => {
-            let inner = &base["Decimal64(".len()..base.len() - 1];
-            let scale = inner.parse::<u32>().unwrap_or(0);
-            BaseType::Decimal {
-                precision: 18,
-                scale,
-            }
-        }
-        _ if base.starts_with("Decimal128(") && base.ends_with(')') => {
-            let inner = &base["Decimal128(".len()..base.len() - 1];
-            let scale = inner.parse::<u32>().unwrap_or(0);
-            BaseType::Decimal {
-                precision: 38,
-                scale,
-            }
-        }
-        _ if base.starts_with("Decimal256(") && base.ends_with(')') => {
-            let inner = &base["Decimal256(".len()..base.len() - 1];
-            let scale = inner.parse::<u32>().unwrap_or(0);
-            BaseType::Decimal {
-                precision: 76,
-                scale,
-            }
-        }
-        _ if base.starts_with("Enum8(") || base.starts_with("Enum16(") => BaseType::String,
-        "UInt8" => BaseType::UInt(8),
-        "UInt16" => BaseType::UInt(16),
-        "UInt32" => BaseType::UInt(32),
-        "UInt64" => BaseType::UInt(64),
-        "UInt128" => BaseType::UInt(128),
-        "UInt256" => BaseType::UInt(256),
-        "Int8" => BaseType::Int(8),
-        "Int16" => BaseType::Int(16),
-        "Int32" => BaseType::Int(32),
-        "Int64" => BaseType::Int(64),
-        "Int128" => BaseType::Int(128),
-        "Int256" => BaseType::Int(256),
-        other => BaseType::Unknown(other.to_string()),
-    }
-}
-
-fn decode_hex_bytes(data: &str) -> Result<Vec<u8>> {
-    let trimmed = data.trim();
-    let without_prefix = trimmed.strip_prefix("0x").unwrap_or(trimmed);
-    if without_prefix.is_empty() {
-        return Ok(Vec::new());
-    }
-    let normalized = if without_prefix.len().is_multiple_of(2) {
-        without_prefix.to_owned()
-    } else {
-        format!("0{}", without_prefix)
-    };
-    hex::decode(normalized).map_err(|err| anyhow!("16進数データのデコードに失敗しました: {}", err))
-}
-
-fn parse_hex_to_u256(value_opt: Option<&Value>, field_name: &str) -> Result<Option<U256>> {
-    match value_opt {
-        Some(Value::String(text)) => {
-            if text.is_empty() || text == "0x" {
-                return Ok(Some(U256::ZERO));
-            }
-            let trimmed = text.trim_start_matches("0x");
-            let normalized = if trimmed.is_empty() { "0" } else { trimmed };
-            U256::from_str_radix(normalized, 16)
-                .map(Some)
-                .map_err(|err| {
-                    anyhow!(
-                        "フィールド `{}` を U256 に変換できませんでした: {}",
-                        field_name,
-                        err
-                    )
-                })
-        }
-        Some(Value::Null) | None => Ok(None),
-        other => bail!(
-            "フィールド `{}` の値が文字列ではありません: {:?}",
-            field_name,
-            other
-        ),
-    }
-}
-
-fn build_numeric_value(
-    type_info: &ColumnTypeInfo,
-    value_opt: Option<&Value>,
-    field_name: &str,
-    column_name: &str,
-) -> Result<Option<QueryValue>> {
-    let parsed = parse_hex_to_u256(value_opt, field_name)?;
-    let convert = |value: U256| -> Result<QueryValue> {
-        match type_info.base {
-            BaseType::DateTime => assign_datetime_value(type_info, value, column_name),
-            BaseType::DateTime64(scale) => {
-                assign_datetime64_value(type_info, value, scale, column_name)
-            }
-            _ => assign_u256_generic(type_info, value, column_name),
-        }
-    };
-
-    match parsed {
-        Some(value) => Ok(Some(convert(value)?)),
-        None => {
-            if type_info.nullable {
-                Ok(Some(null_query_value(type_info)))
-            } else {
-                Ok(Some(convert(U256::ZERO)?))
-            }
-        }
-    }
-}
-
-fn assign_datetime_value(
-    type_info: &ColumnTypeInfo,
-    value: U256,
-    column_name: &str,
-) -> Result<QueryValue> {
-    let seconds: u64 = value.try_into().map_err(|_| {
-        anyhow!(
-            "カラム `{}` に格納するタイムスタンプが u64 を超えています",
-            column_name
-        )
-    })?;
-    build_number_from_u64(type_info, seconds)
-}
-
-fn assign_datetime64_value(
-    type_info: &ColumnTypeInfo,
-    value: U256,
-    scale: u32,
-    column_name: &str,
-) -> Result<QueryValue> {
-    let seconds: u64 = value.try_into().map_err(|_| {
-        anyhow!(
-            "カラム `{}` に格納するタイムスタンプが u64 を超えています",
-            column_name
-        )
-    })?;
-    let multiplier = 10u64.checked_pow(scale).ok_or_else(|| {
-        anyhow!(
-            "DateTime64 カラム `{}` のスケール {} が大きすぎます",
-            column_name,
-            scale
-        )
-    })?;
-    let scaled = seconds.checked_mul(multiplier).ok_or_else(|| {
-        anyhow!(
-            "DateTime64 カラム `{}` への値変換でオーバーフローしました",
-            column_name
-        )
-    })?;
-    build_number_from_u64(type_info, scaled)
-}
-
-fn assign_u256_generic(
-    type_info: &ColumnTypeInfo,
-    value: U256,
-    column_name: &str,
-) -> Result<QueryValue> {
-    match type_info.base {
-        BaseType::UInt(bits) if bits <= 64 => {
-            let val: u64 = value.try_into().map_err(|_| {
-                anyhow!(
-                    "カラム `{}` に格納する値が {}bit の範囲を超えています",
-                    column_name,
-                    bits
-                )
-            })?;
-            if type_info.nullable {
-                Ok(QueryValue::NullableUInt64(Some(val)))
-            } else {
-                Ok(QueryValue::UInt64(val))
-            }
-        }
-        BaseType::Float(_) => {
-            let decimal = value.to_string();
-            let float_val: f64 = decimal.parse().map_err(|err| {
-                anyhow!(
-                    "カラム `{}` の値を f64 に変換できませんでした: {}",
-                    column_name,
-                    err
-                )
-            })?;
-            if type_info.nullable {
-                Ok(QueryValue::NullableFloat64(Some(float_val)))
-            } else {
-                Ok(QueryValue::Float64(float_val))
-            }
-        }
-        BaseType::Bool => {
-            let is_true = !value.is_zero();
-            if type_info.nullable {
-                Ok(QueryValue::NullableBool(Some(is_true)))
-            } else {
-                Ok(QueryValue::Bool(is_true))
-            }
-        }
-        BaseType::Int(bits) if bits <= 64 => {
-            let val: u64 = value.try_into().map_err(|_| {
-                anyhow!(
-                    "カラム `{}` に格納する値が変換できませんでした",
-                    column_name
-                )
-            })?;
-            if val > i64::MAX as u64 {
-                bail!("カラム `{}` に格納する値が i64 を超えています", column_name);
-            }
-            let signed = val as i64;
-            if type_info.nullable {
-                Ok(QueryValue::NullableInt64(Some(signed)))
-            } else {
-                Ok(QueryValue::Int64(signed))
-            }
-        }
-        _ => {
-            let decimal = value.to_string();
-            if type_info.nullable {
-                Ok(QueryValue::NullableString(Some(decimal)))
-            } else {
-                Ok(QueryValue::String(decimal))
-            }
-        }
-    }
-}
-
-fn build_hex_value(
-    type_info: &ColumnTypeInfo,
-    value_opt: Option<&Value>,
-    field_name: &str,
-    column_name: &str,
-) -> Result<Option<QueryValue>> {
-    match type_info.base {
-        BaseType::String | BaseType::Unknown(_) => match value_opt {
-            Some(Value::String(text)) => {
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableString(Some(text.clone()))))
-                } else {
-                    Ok(Some(QueryValue::String(text.clone())))
-                }
-            }
-            Some(Value::Null) | None => {
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableString(None)))
-                } else {
-                    Ok(Some(QueryValue::String("0x0".to_string())))
-                }
-            }
-            other => bail!(
-                "フィールド `{}` の値が文字列ではありません: {:?}",
-                field_name,
-                other
-            ),
-        },
-        BaseType::FixedString(_) => match value_opt {
-            Some(Value::String(text)) => {
-                let bytes = decode_hex_bytes(text)?;
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableBytes(Some(bytes))))
-                } else {
-                    Ok(Some(QueryValue::Bytes(bytes)))
-                }
-            }
-            Some(Value::Null) | None => {
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableBytes(None)))
-                } else {
-                    Ok(Some(QueryValue::Bytes(Vec::new())))
-                }
-            }
-            other => bail!(
-                "フィールド `{}` の値が文字列ではありません: {:?}",
-                field_name,
-                other
-            ),
-        },
-        _ => build_numeric_value(type_info, value_opt, field_name, column_name),
-    }
-}
-
-fn build_string_value(
-    type_info: &ColumnTypeInfo,
-    value_opt: Option<&Value>,
-    field_name: &str,
-    column_name: &str,
-) -> Result<Option<QueryValue>> {
-    match value_opt {
-        Some(Value::String(text)) => {
-            if type_info.nullable {
-                Ok(Some(QueryValue::NullableString(Some(text.clone()))))
-            } else {
-                Ok(Some(QueryValue::String(text.clone())))
-            }
-        }
-        Some(Value::Null) | None => {
-            if type_info.nullable {
-                Ok(Some(QueryValue::NullableString(None)))
-            } else {
-                bail!(
-                    "フィールド `{}` の値が存在せず、カラム `{}` は Nullable ではありません",
-                    field_name,
-                    column_name
-                );
-            }
-        }
-        other => bail!(
-            "フィールド `{}` の値が文字列ではありません: {:?}",
-            field_name,
-            other
-        ),
-    }
-}
-
-fn build_json_value(
-    type_info: &ColumnTypeInfo,
-    value_opt: Option<&Value>,
-    column_name: &str,
-) -> Result<Option<QueryValue>> {
-    match type_info.base {
-        BaseType::ArrayString => match value_opt {
-            None | Some(Value::Null) => {
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableArrayString(None)))
-                } else {
-                    Ok(Some(QueryValue::ArrayString(Vec::new())))
-                }
-            }
-            Some(Value::Array(items)) => {
-                let mut vec = Vec::with_capacity(items.len());
-                for item in items {
-                    match item {
-                        Value::String(text) => vec.push(text.clone()),
-                        other => {
-                            bail!(
-                                "カラム `{}` に配列以外の要素が含まれています: {:?}",
-                                column_name,
-                                other
-                            );
-                        }
-                    }
-                }
-
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableArrayString(Some(vec))))
-                } else {
-                    Ok(Some(QueryValue::ArrayString(vec)))
-                }
-            }
-            Some(Value::String(text)) => {
-                let parsed: Vec<String> = serde_json::from_str(text).with_context(|| {
-                    format!(
-                        "カラム `{}` の文字列を配列として解釈できませんでした",
-                        column_name
-                    )
-                })?;
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableArrayString(Some(parsed))))
-                } else {
-                    Ok(Some(QueryValue::ArrayString(parsed)))
-                }
-            }
-            Some(other) => bail!(
-                "カラム `{}` に対応する値が配列ではありません: {:?}",
-                column_name,
-                other
-            ),
-        },
-        _ => match value_opt {
-            None | Some(Value::Null) => {
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableString(None)))
-                } else {
-                    bail!(
-                        "カラム `{}` の値が存在しませんが Nullable ではありません",
-                        column_name
-                    );
-                }
-            }
-            Some(value) => {
-                let serialized = serde_json::to_string(value).with_context(|| {
-                    format!("カラム `{}` 用のJSON変換に失敗しました", column_name)
-                })?;
-                if type_info.nullable {
-                    Ok(Some(QueryValue::NullableString(Some(serialized))))
-                } else {
-                    Ok(Some(QueryValue::String(serialized)))
-                }
-            }
-        },
-    }
-}
-
-fn build_number_from_u64(type_info: &ColumnTypeInfo, value: u64) -> Result<QueryValue> {
-    match type_info.base {
-        BaseType::UInt(bits) if bits <= 64 => {
-            if type_info.nullable {
-                Ok(QueryValue::NullableUInt64(Some(value)))
-            } else {
-                Ok(QueryValue::UInt64(value))
-            }
-        }
-        BaseType::Int(bits) if bits <= 64 => {
-            if value > i64::MAX as u64 {
-                bail!("値が有効範囲を超えています");
-            }
-            let signed = value as i64;
-            if type_info.nullable {
-                Ok(QueryValue::NullableInt64(Some(signed)))
-            } else {
-                Ok(QueryValue::Int64(signed))
-            }
-        }
-        BaseType::Float(_) => {
-            let as_f64 = value as f64;
-            if type_info.nullable {
-                Ok(QueryValue::NullableFloat64(Some(as_f64)))
-            } else {
-                Ok(QueryValue::Float64(as_f64))
-            }
-        }
-        _ => {
-            let text = value.to_string();
-            if type_info.nullable {
-                Ok(QueryValue::NullableString(Some(text)))
-            } else {
-                Ok(QueryValue::String(text))
-            }
-        }
-    }
-}
-
-fn null_query_value(type_info: &ColumnTypeInfo) -> QueryValue {
-    match type_info.base {
-        BaseType::UInt(_) | BaseType::DateTime | BaseType::DateTime64(_) => {
-            QueryValue::NullableUInt64(None)
-        }
-        BaseType::Int(_) => QueryValue::NullableInt64(None),
-        BaseType::Float(_) => QueryValue::NullableFloat64(None),
-        BaseType::Bool => QueryValue::NullableBool(None),
-        BaseType::FixedString(_) => QueryValue::NullableBytes(None),
-        BaseType::ArrayString => QueryValue::NullableArrayString(None),
-        _ => QueryValue::NullableString(None),
-    }
 }
 
 async fn print_table_schema(client: &Client, table: &str, label: &str) -> Result<Vec<ColumnInfo>> {
@@ -2650,6 +1437,8 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
     println!("  3) Duplicate block detection");
     println!("  4) Transaction table gap detection");
     println!("  5) Unfinished mutation count");
+    println!("  6) Optimize blocks table (runs OPTIMIZE TABLE ... FINAL)");
+    println!("  7) Optimize transactions table (runs OPTIMIZE TABLE ... FINAL)");
     println!("Enter numbers separated by commas (e.g. `1,3`) or press Enter for all:");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
@@ -2665,6 +1454,8 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         tx_mismatch: false,
         duplicates: false,
         mutations: false,
+        optimize_blocks: false,
+        optimize_transactions: false,
     };
 
     if read == 0 || input.trim().is_empty() {
@@ -2673,6 +1464,8 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         selection.tx_mismatch = true;
         selection.duplicates = true;
         selection.mutations = true;
+        selection.optimize_blocks = false;
+        selection.optimize_transactions = false;
         return Ok(selection);
     }
 
@@ -2697,12 +1490,20 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
             "5" | "mutation" | "mutations" | "unfinished" | "unfinished_mutations" => {
                 selection.mutations = true;
             }
+            "6" | "optimize" | "optimize_blocks" | "optimize-blocks" => {
+                selection.optimize_blocks = true;
+            }
+            "7" | "optimize_tx" | "optimize_transactions" | "optimize-transactions" => {
+                selection.optimize_transactions = true;
+            }
             "all" | "a" => {
                 selection.block_gap = true;
                 selection.tx_gap = true;
                 selection.tx_mismatch = true;
                 selection.duplicates = true;
                 selection.mutations = true;
+                selection.optimize_blocks = true;
+                selection.optimize_transactions = true;
             }
             other => {
                 bail!("Unknown selection: `{}`", other);
@@ -2715,6 +1516,8 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         && !selection.tx_mismatch
         && !selection.duplicates
         && !selection.mutations
+        && !selection.optimize_blocks
+        && !selection.optimize_transactions
     {
         bail!("No checks selected.");
     }

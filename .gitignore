@@ -12,3 +12,6 @@ screenlog.*
 .env
 .env.*
 !.env.example
+
+# Others
+/target_local/
