@@ -1,10 +1,17 @@
+use alloy::consensus::{
+    BlockHeader, Transaction as ConsensusTransactionTrait, TxEnvelope, Typed2718,
+};
 use alloy::eips::BlockNumberOrTag;
+use alloy::network::TransactionResponse;
+use alloy::primitives::{Signature, TxKind, B256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+use alloy::rpc::types::eth::{Block as RpcBlock, Transaction as RpcTransaction};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use clickhouse::Client;
 use log::info;
 use reqwest::Url;
+use serde_json::json;
 use std::io::{self, Write};
 
 const DEFAULT_CLICKHOUSE_ADDRESS: &str = env!("CLICKHOUSE_ADDRESS");
@@ -15,6 +22,7 @@ const DEFAULT_CLICKHOUSE_DATABASE: &str = env!("CLICKHOUSE_DATABASE");
 const DEFAULT_ETH_NODE_URL: &str = env!("ETH_NODE_URL");
 const TX_CHUNK_SIZE: usize = 10_000;
 const DUPLICATE_SAMPLE_LIMIT: usize = 20;
+const INSERT_BATCH_SIZE: usize = 256;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -54,6 +62,13 @@ struct Args {
         default_value = "block_number"
     )]
     transactions_block_column: String,
+    /// Column name that stores the transaction hash in the transactions table
+    #[arg(
+        long,
+        env = "TRANSACTIONS_HASH_COLUMN",
+        default_value = "hash"
+    )]
+    transactions_hash_column: String,
     /// Ethereum node RPC endpoint
     #[arg(long, env = "ETH_NODE_URL", default_value = DEFAULT_ETH_NODE_URL)]
     eth_node_url: String,
@@ -207,6 +222,12 @@ async fn main() -> Result<()> {
         &args.transactions_block_column,
         &args.transactions_table,
         "--transactions-block-column",
+    )?;
+    ensure_column_exists(
+        &tx_columns,
+        &args.transactions_hash_column,
+        &args.transactions_table,
+        "--transactions-hash-column",
     )?;
 
     if checks.mutations {
@@ -453,6 +474,10 @@ fn validate_identifiers(args: &Args) -> Result<()> {
     ensure_identifier(
         &args.transactions_block_column,
         "transactions.block_number column",
+    )?;
+    ensure_identifier(
+        &args.transactions_hash_column,
+        "transactions.hash column",
     )?;
     Ok(())
 }
@@ -1314,24 +1339,576 @@ async fn repair_transaction_mismatches(
 }
 
 async fn fill_missing_blocks_and_transactions(
-    _client: &Client,
-    _provider: &impl Provider,
-    _args: &Args,
-    _block_columns: &[ColumnInfo],
-    _tx_columns: &[ColumnInfo],
+    client: &Client,
+    provider: &impl Provider,
+    args: &Args,
+    block_columns: &[ColumnInfo],
+    tx_columns: &[ColumnInfo],
     missing_ranges: &[(u64, u64)],
 ) -> Result<()> {
     if missing_ranges.is_empty() {
         return Ok(());
     }
 
+    let block_insert_columns = select_block_insert_columns(block_columns);
+    if block_insert_columns.is_empty() {
+        bail!(
+            "ブロックテーブル `{}` に補完で利用可能なカラムが見つかりません。",
+            args.blocks_table
+        );
+    }
+
+    let tx_insert_columns = select_transaction_insert_columns(tx_columns);
+    if tx_columns.is_empty() {
+        info!("トランザクションテーブルのスキーマ情報が空です。トランザクション補完をスキップします。");
+    } else if tx_insert_columns.is_empty() {
+        println!(
+            "トランザクションテーブル `{}` に対応可能なカラムがないため、トランザクション補完をスキップします。",
+            args.transactions_table
+        );
+        info!(
+            "transactions テーブルに対応する補完カラムが存在しないため INSERT をスキップします。"
+        );
+    }
+
     println!(
-        "欠損範囲が {} 件見つかりましたが、読み取り専用モードのため補完処理をスキップします。",
+        "欠損範囲 {} 件について Ethereum ノードから再取得し ClickHouse に補完します。",
         missing_ranges.len()
     );
-    info!("欠損データ補完は無効化されています。");
 
+    let mut total_blocks_inserted = 0usize;
+    let mut total_transactions_inserted = 0usize;
+
+    for &(start, end) in missing_ranges {
+        println!("ブロック範囲 {}-{} を補完中...", start, end);
+        let mut block_rows: Vec<Vec<String>> = Vec::new();
+        let mut tx_rows: Vec<Vec<String>> = Vec::new();
+        let mut range_blocks_inserted = 0usize;
+        let mut range_tx_inserted = 0usize;
+
+        for number in start..=end {
+            let block = load_block(provider, number).await?;
+
+            let block_row = render_block_row(&block, &block_insert_columns)?;
+            block_rows.push(block_row);
+
+            if !tx_insert_columns.is_empty() {
+                let mut rendered_txs = render_transaction_rows(&block, &tx_insert_columns)?;
+                tx_rows.append(&mut rendered_txs);
+            }
+
+            if block_rows.len() >= INSERT_BATCH_SIZE {
+                let pending = block_rows.len();
+                insert_rows(
+                    client,
+                    &args.blocks_table,
+                    &block_insert_columns,
+                    &block_rows,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "ClickHouse へのブロック INSERT に失敗しました (範囲 {}-{})",
+                        start, end
+                    )
+                })?;
+                block_rows.clear();
+                range_blocks_inserted += pending;
+                total_blocks_inserted += pending;
+            }
+
+            if tx_rows.len() >= INSERT_BATCH_SIZE {
+                if !tx_insert_columns.is_empty() {
+                    let pending = tx_rows.len();
+                    insert_rows(
+                        client,
+                        &args.transactions_table,
+                        &tx_insert_columns,
+                        &tx_rows,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "ClickHouse へのトランザクション INSERT に失敗しました (範囲 {}-{})",
+                            start, end
+                        )
+                    })?;
+                    range_tx_inserted += pending;
+                    total_transactions_inserted += pending;
+                }
+                tx_rows.clear();
+            }
+        }
+
+        if !block_rows.is_empty() {
+            let pending = block_rows.len();
+            insert_rows(
+                client,
+                &args.blocks_table,
+                &block_insert_columns,
+                &block_rows,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "ClickHouse へのブロック INSERT に失敗しました (範囲 {}-{})",
+                    start, end
+                )
+            })?;
+            range_blocks_inserted += pending;
+            total_blocks_inserted += pending;
+        }
+
+        if !tx_rows.is_empty() && !tx_insert_columns.is_empty() {
+            let pending = tx_rows.len();
+            insert_rows(
+                client,
+                &args.transactions_table,
+                &tx_insert_columns,
+                &tx_rows,
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "ClickHouse へのトランザクション INSERT に失敗しました (範囲 {}-{})",
+                    start, end
+                )
+            })?;
+            range_tx_inserted += pending;
+            total_transactions_inserted += pending;
+        }
+
+        println!(
+            "  補完完了: ブロック {} 件、トランザクション {} 件",
+            range_blocks_inserted, range_tx_inserted
+        );
+    }
+
+    println!(
+        "欠損データの補完が完了しました (合計: ブロック {} 件、トランザクション {} 件)。",
+        total_blocks_inserted, total_transactions_inserted
+    );
     Ok(())
+}
+
+fn select_block_insert_columns<'a>(columns: &'a [ColumnInfo]) -> Vec<&'a ColumnInfo> {
+    columns
+        .iter()
+        .filter(|column| is_supported_block_column(&column.name))
+        .collect()
+}
+
+fn select_transaction_insert_columns<'a>(columns: &'a [ColumnInfo]) -> Vec<&'a ColumnInfo> {
+    columns
+        .iter()
+        .filter(|column| is_supported_transaction_column(&column.name))
+        .collect()
+}
+
+async fn load_block(provider: &impl Provider, number: u64) -> Result<RpcBlock> {
+    provider
+        .get_block_by_number(BlockNumberOrTag::Number(number))
+        .full()
+        .await
+        .with_context(|| format!("ブロック {number} の取得に失敗しました"))?
+        .ok_or_else(|| anyhow!("Ethereum ノードからブロック {number} が取得できませんでした"))
+}
+
+fn render_block_row(block: &RpcBlock, columns: &[&ColumnInfo]) -> Result<Vec<String>> {
+    let mut values = Vec::with_capacity(columns.len());
+    for column in columns {
+        values.push(render_block_value(column, block)?);
+    }
+    Ok(values)
+}
+
+fn render_block_value(column: &ColumnInfo, block: &RpcBlock) -> Result<String> {
+    let normalized = column.name.to_ascii_lowercase();
+    let header = &block.header;
+
+    let value = match normalized.as_str() {
+        "number" => header.number().to_string(),
+        "hash" => sql_string_literal(&format!("{:#x}", header.hash)),
+        "parent_hash" => sql_string_literal(&format!("{:#x}", header.parent_hash())),
+        "ommers_hash" => sql_string_literal(&format!("{:#x}", header.ommers_hash())),
+        "timestamp" => header.timestamp().to_string(),
+        "miner" => sql_string_literal(&format!("{:#x}", header.beneficiary())),
+        "gas_limit" => header.gas_limit().to_string(),
+        "gas_used" => header.gas_used().to_string(),
+        "base_fee_per_gas" => match header.base_fee_per_gas {
+            Some(value) => value.to_string(),
+            None => "NULL".to_string(),
+        },
+        "state_root" => sql_string_literal(&format!("{:#x}", header.state_root())),
+        "transactions_root" => sql_string_literal(&format!("{:#x}", header.transactions_root())),
+        "tx_count" => block.transactions.len().to_string(),
+        "receipts_root" => sql_string_literal(&format!("{:#x}", header.receipts_root())),
+        "logs_bloom" => sql_string_literal(&format!("{:#x}", header.logs_bloom())),
+        "difficulty" => sql_string_literal(&header.difficulty().to_string()),
+        "total_difficulty" => match header.total_difficulty {
+            Some(value) => sql_string_literal(&value.to_string()),
+            None => "NULL".to_string(),
+        },
+        "size_bytes" => match header.size {
+            Some(size) => size.to_string(),
+            None => "NULL".to_string(),
+        },
+        "extra_data" => sql_string_literal(&format!("{:#x}", header.extra_data)),
+        "mix_hash" => header
+            .mix_hash()
+            .map(|value| sql_string_literal(&format!("{:#x}", value)))
+            .unwrap_or_else(|| "NULL".to_string()),
+        "nonce" => header
+            .nonce()
+            .map(|value| sql_string_literal(&format!("{:#x}", value)))
+            .unwrap_or_else(|| "NULL".to_string()),
+        "withdrawals_root" => match header.withdrawals_root {
+            Some(root) => sql_string_literal(&format!("{:#x}", root)),
+            None => "NULL".to_string(),
+        },
+        "blob_gas_used" => match header.blob_gas_used {
+            Some(value) => value.to_string(),
+            None => "NULL".to_string(),
+        },
+        "excess_blob_gas" => match header.excess_blob_gas {
+            Some(value) => value.to_string(),
+            None => "NULL".to_string(),
+        },
+        "parent_beacon_block_root" => match header.parent_beacon_block_root {
+            Some(value) => sql_string_literal(&format!("{:#x}", value)),
+            None => "NULL".to_string(),
+        },
+        "requests_hash" => match header.requests_hash {
+            Some(value) => sql_string_literal(&format!("{:#x}", value)),
+            None => "NULL".to_string(),
+        },
+        "uncles" => {
+            let items: Vec<String> = block
+                .uncles
+                .iter()
+                .map(|hash| sql_string_literal(&format!("{:#x}", hash)))
+                .collect();
+            sql_array_literal(&items)
+        }
+        "withdrawals" => match &block.withdrawals {
+            Some(withdrawals) => {
+                let json_value = json!(withdrawals);
+                sql_string_literal(&json_value.to_string())
+            }
+            None => "NULL".to_string(),
+        },
+        "version" => "now()".to_string(),
+        other => {
+            bail!("ブロックカラム `{}` は補完対象に対応していません", other);
+        }
+    };
+
+    Ok(value)
+}
+
+fn render_transaction_rows(block: &RpcBlock, columns: &[&ColumnInfo]) -> Result<Vec<Vec<String>>> {
+    if columns.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let Some(transactions) = block.transactions.as_transactions() else {
+        bail!(
+            "ブロック {} のトランザクションがハッシュのみで返却されました。full() 指定で取得できていない可能性があります。",
+            block.header.number()
+        );
+    };
+
+    let block_hash = block.header.hash;
+    let block_number = block.header.number();
+    let base_fee = block.header.base_fee_per_gas;
+
+    let mut rows = Vec::with_capacity(transactions.len());
+    for (idx, tx) in transactions.iter().enumerate() {
+        let mut values = Vec::with_capacity(columns.len());
+        for column in columns {
+            values.push(render_transaction_value(
+                column,
+                tx,
+                block_hash,
+                block_number,
+                idx as u64,
+                base_fee,
+            )?);
+        }
+        rows.push(values);
+    }
+
+    Ok(rows)
+}
+
+fn render_transaction_value(
+    column: &ColumnInfo,
+    tx: &RpcTransaction,
+    block_hash: B256,
+    block_number: u64,
+    tx_index: u64,
+    base_fee: Option<u64>,
+) -> Result<String> {
+    let normalized = column.name.to_ascii_lowercase();
+    let signature = extract_signature(tx);
+
+    let value = match normalized.as_str() {
+        "hash" => sql_string_literal(&format!("{:#x}", tx.tx_hash())),
+        "block_hash" => sql_string_literal(&format!("{:#x}", block_hash)),
+        "block_number" => block_number.to_string(),
+        "transaction_index" => tx_index.to_string(),
+        "from_address" => sql_string_literal(&format!("{:#x}", tx.from())),
+        "to_address" => match ConsensusTransactionTrait::kind(tx) {
+            TxKind::Call(address) => sql_string_literal(&format!("{:#x}", address)),
+            TxKind::Create => "NULL".to_string(),
+        },
+        "value" => sql_string_literal(&ConsensusTransactionTrait::value(tx).to_string()),
+        "nonce" => ConsensusTransactionTrait::nonce(tx).to_string(),
+        "gas_limit" => ConsensusTransactionTrait::gas_limit(tx).to_string(),
+        "gas_price" => match ConsensusTransactionTrait::gas_price(tx) {
+            Some(value) => sql_string_literal(&value.to_string()),
+            None => "NULL".to_string(),
+        },
+        "max_fee_per_gas" => {
+            sql_string_literal(&ConsensusTransactionTrait::max_fee_per_gas(tx).to_string())
+        }
+        "max_priority_fee_per_gas" => match ConsensusTransactionTrait::max_priority_fee_per_gas(tx)
+        {
+            Some(value) => sql_string_literal(&value.to_string()),
+            None => "NULL".to_string(),
+        },
+        "max_fee_per_blob_gas" => match ConsensusTransactionTrait::max_fee_per_blob_gas(tx) {
+            Some(value) => sql_string_literal(&value.to_string()),
+            None => "NULL".to_string(),
+        },
+        "effective_gas_price" => sql_string_literal(
+            &ConsensusTransactionTrait::effective_gas_price(tx, base_fee).to_string(),
+        ),
+        "transaction_type" => Typed2718::ty(tx).to_string(),
+        "chain_id" => match ConsensusTransactionTrait::chain_id(tx) {
+            Some(chain_id) => chain_id.to_string(),
+            None => "NULL".to_string(),
+        },
+        "access_list" => match ConsensusTransactionTrait::access_list(tx) {
+            Some(list) => {
+                let json_value = json!(list);
+                sql_string_literal(&json_value.to_string())
+            }
+            None => "NULL".to_string(),
+        },
+        "blob_versioned_hashes" => match ConsensusTransactionTrait::blob_versioned_hashes(tx) {
+            Some(hashes) => {
+                let items: Vec<String> = hashes
+                    .iter()
+                    .map(|hash| sql_string_literal(&format!("{:#x}", hash)))
+                    .collect();
+                sql_array_literal(&items)
+            }
+            None => "[]".to_string(),
+        },
+        "authorization_list" => match ConsensusTransactionTrait::authorization_list(tx) {
+            Some(list) => {
+                let json_value = json!(list);
+                sql_string_literal(&json_value.to_string())
+            }
+            None => "NULL".to_string(),
+        },
+        "input" => sql_string_literal(&format!("{:#x}", ConsensusTransactionTrait::input(tx))),
+        "y_parity" => match signature {
+            Some(sig) => (sig.v() as u8).to_string(),
+            None => "NULL".to_string(),
+        },
+        "v" => match signature {
+            Some(sig) => {
+                let tx_type = Typed2718::ty(tx);
+                let parity = if sig.v() { 1u64 } else { 0u64 };
+                let legacy_v = if tx_type == 0 {
+                    match ConsensusTransactionTrait::chain_id(tx) {
+                        Some(chain_id) => chain_id
+                            .saturating_mul(2)
+                            .saturating_add(35)
+                            .saturating_add(parity),
+                        None => 27 + parity,
+                    }
+                } else {
+                    27 + parity
+                };
+                legacy_v.to_string()
+            }
+            None => "NULL".to_string(),
+        },
+        "r" => match signature {
+            Some(sig) => sql_string_literal(&format!("{:#x}", sig.r())),
+            None => "NULL".to_string(),
+        },
+        "s" => match signature {
+            Some(sig) => sql_string_literal(&format!("{:#x}", sig.s())),
+            None => "NULL".to_string(),
+        },
+        "version" => "now()".to_string(),
+        other => {
+            bail!(
+                "トランザクションカラム `{}` は補完対象に対応していません",
+                other
+            );
+        }
+    };
+
+    Ok(value)
+}
+
+async fn insert_rows(
+    client: &Client,
+    table: &str,
+    columns: &[&ColumnInfo],
+    rows: &[Vec<String>],
+) -> Result<()> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let column_list = columns
+        .iter()
+        .map(|column| sql_identifier(&column.name))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let values = rows
+        .iter()
+        .map(|row| format!("({})", row.join(", ")))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES {}",
+        sql_identifier(table),
+        column_list,
+        values
+    );
+
+    client
+        .query(&sql)
+        .execute()
+        .await
+        .with_context(|| format!("クエリ `{}` の実行に失敗しました", sql))
+}
+
+fn sql_identifier(identifier: &str) -> String {
+    identifier
+        .split('.')
+        .map(|part| {
+            let mut escaped = String::with_capacity(part.len() + 2);
+            escaped.push('`');
+            for ch in part.chars() {
+                if ch == '`' || ch == '\\' {
+                    escaped.push('\\');
+                }
+                escaped.push(ch);
+            }
+            escaped.push('`');
+            escaped
+        })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+fn sql_string_literal(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len() + 2);
+    escaped.push('\'');
+    for ch in value.chars() {
+        match ch {
+            '\\' | '\'' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped.push('\'');
+    escaped
+}
+
+fn sql_array_literal(items: &[String]) -> String {
+    if items.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{}]", items.join(", "))
+    }
+}
+
+fn is_supported_block_column(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "number"
+            | "hash"
+            | "parent_hash"
+            | "ommers_hash"
+            | "timestamp"
+            | "miner"
+            | "gas_limit"
+            | "gas_used"
+            | "base_fee_per_gas"
+            | "state_root"
+            | "transactions_root"
+            | "tx_count"
+            | "receipts_root"
+            | "logs_bloom"
+            | "difficulty"
+            | "total_difficulty"
+            | "size_bytes"
+            | "extra_data"
+            | "mix_hash"
+            | "nonce"
+            | "withdrawals_root"
+            | "blob_gas_used"
+            | "excess_blob_gas"
+            | "parent_beacon_block_root"
+            | "requests_hash"
+            | "uncles"
+            | "withdrawals"
+            | "version"
+    )
+}
+
+fn is_supported_transaction_column(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "block_number"
+            | "block_hash"
+            | "transaction_index"
+            | "hash"
+            | "from_address"
+            | "to_address"
+            | "value"
+            | "nonce"
+            | "gas_limit"
+            | "gas_price"
+            | "max_fee_per_gas"
+            | "max_priority_fee_per_gas"
+            | "max_fee_per_blob_gas"
+            | "effective_gas_price"
+            | "transaction_type"
+            | "chain_id"
+            | "access_list"
+            | "blob_versioned_hashes"
+            | "authorization_list"
+            | "input"
+            | "y_parity"
+            | "v"
+            | "r"
+            | "s"
+            | "version"
+    )
+}
+
+fn extract_signature(tx: &RpcTransaction) -> Option<&Signature> {
+    match tx.inner.as_ref() {
+        TxEnvelope::Legacy(signed) => Some(signed.signature()),
+        TxEnvelope::Eip2930(signed) => Some(signed.signature()),
+        TxEnvelope::Eip1559(signed) => Some(signed.signature()),
+        TxEnvelope::Eip4844(signed) => Some(signed.signature()),
+        TxEnvelope::Eip7702(signed) => Some(signed.signature()),
+    }
 }
 
 async fn print_table_schema(client: &Client, table: &str, label: &str) -> Result<Vec<ColumnInfo>> {
