@@ -63,11 +63,7 @@ struct Args {
     )]
     transactions_block_column: String,
     /// Column name that stores the transaction hash in the transactions table
-    #[arg(
-        long,
-        env = "TRANSACTIONS_HASH_COLUMN",
-        default_value = "hash"
-    )]
+    #[arg(long, env = "TRANSACTIONS_HASH_COLUMN", default_value = "hash")]
     transactions_hash_column: String,
     /// Ethereum node RPC endpoint
     #[arg(long, env = "ETH_NODE_URL", default_value = DEFAULT_ETH_NODE_URL)]
@@ -105,6 +101,19 @@ struct BlockDuplicateReport {
 #[derive(Debug)]
 struct BlockDuplicateEntry {
     block_number: u64,
+    occurrences: u64,
+}
+
+#[derive(Debug)]
+struct TransactionDuplicateReport {
+    total_extra_rows: u64,
+    samples: Vec<TransactionDuplicateEntry>,
+    truncated: bool,
+}
+
+#[derive(Debug)]
+struct TransactionDuplicateEntry {
+    tx_hash: String,
     occurrences: u64,
 }
 
@@ -155,6 +164,7 @@ struct SelectedChecks {
     tx_gap: bool,
     tx_mismatch: bool,
     duplicates: bool,
+    tx_duplicates: bool,
     mutations: bool,
     optimize_blocks: bool,
     optimize_transactions: bool,
@@ -260,12 +270,19 @@ async fn main() -> Result<()> {
     );
 
     if checks.duplicates && block_stats.total_rows > block_stats.distinct_count {
-        println!(
-            "Warning: found {} duplicate block rows.",
-            block_stats.total_rows - block_stats.distinct_count
-        );
-        if let Some(duplicates) =
-            find_duplicate_blocks(&client, &args, blocks_meta.apply_final).await?
+        let duplicate_rows = block_stats
+            .total_rows
+            .checked_sub(block_stats.distinct_count)
+            .unwrap_or(0);
+        println!("Warning: found {} duplicate block rows.", duplicate_rows);
+        if let Some(duplicates) = find_duplicate_blocks(
+            &client,
+            &args,
+            blocks_meta.apply_final,
+            block_stats.total_rows,
+            duplicate_rows,
+        )
+        .await?
         {
             println!(
                 "Detected {} duplicate row(s) across {} block number(s):",
@@ -283,6 +300,54 @@ async fn main() -> Result<()> {
                     "  ...and more (showing first {} block numbers).",
                     DUPLICATE_SAMPLE_LIMIT
                 );
+            }
+        }
+    }
+
+    if checks.tx_duplicates {
+        match fetch_hash_column_stats(
+            &client,
+            &args.transactions_table,
+            &args.transactions_hash_column,
+            tx_meta.apply_final,
+        )
+        .await?
+        {
+            None => println!(
+                "No transactions found in table `{}`.",
+                args.transactions_table
+            ),
+            Some((total_rows, distinct_values)) => {
+                let duplicate_rows = total_rows.saturating_sub(distinct_values);
+                if duplicate_rows == 0 {
+                    println!(
+                        "No duplicate transaction hashes found in table `{}`.",
+                        args.transactions_table
+                    );
+                } else if let Some(duplicates) = find_duplicate_transactions(
+                    &client,
+                    &args,
+                    tx_meta.apply_final,
+                    total_rows,
+                    duplicate_rows,
+                )
+                .await?
+                {
+                    println!(
+                        "Detected {} duplicate transaction occurrence(s) across {} hash(es):",
+                        duplicates.total_extra_rows,
+                        duplicates.samples.len()
+                    );
+                    for entry in &duplicates.samples {
+                        println!("  tx {} appears {} times", entry.tx_hash, entry.occurrences);
+                    }
+                    if duplicates.truncated {
+                        println!(
+                            "  ...and more (showing first {} transaction hash(es)).",
+                            DUPLICATE_SAMPLE_LIMIT
+                        );
+                    }
+                }
             }
         }
     }
@@ -475,10 +540,7 @@ fn validate_identifiers(args: &Args) -> Result<()> {
         &args.transactions_block_column,
         "transactions.block_number column",
     )?;
-    ensure_identifier(
-        &args.transactions_hash_column,
-        "transactions.hash column",
-    )?;
+    ensure_identifier(&args.transactions_hash_column, "transactions.hash column")?;
     Ok(())
 }
 
@@ -639,84 +701,210 @@ fn report_missing_ranges(ranges: &[(u64, u64)], context: &str) {
     }
 }
 
+const DUPLICATE_SCAN_CHUNK: usize = 4096;
+
 async fn find_duplicate_blocks(
     client: &Client,
     args: &Args,
     use_final: bool,
+    total_rows: u64,
+    duplicate_rows: u64,
 ) -> Result<Option<BlockDuplicateReport>> {
-    #[derive(clickhouse::Row, serde::Deserialize)]
-    struct DuplicateCountRow {
-        duplicate_rows: i64,
-    }
-
-    #[derive(clickhouse::Row, serde::Deserialize)]
-    struct DuplicateSampleRow {
-        block_number: u64,
-        occurrences: u64,
-    }
-
-    let final_clause = final_clause(use_final);
-    let count_query = format!(
-        "SELECT ifNull(sum(occurrences - 1), 0) AS duplicate_rows \
-         FROM ( \
-            SELECT count() AS occurrences \
-            FROM {table}{final_clause} \
-            GROUP BY {col} \
-            HAVING occurrences > 1 \
-         )",
-        table = args.blocks_table,
-        col = args.blocks_number_column,
-        final_clause = final_clause
-    );
-
-    let duplicate_rows_raw: i64 = client
-        .query(&count_query)
-        .fetch_one::<DuplicateCountRow>()
-        .await?
-        .duplicate_rows;
-
-    let duplicate_rows = u64::try_from(duplicate_rows_raw).map_err(|_| {
-        anyhow!(
-            "ClickHouse returned negative duplicate row count ({}) for table `{}`",
-            duplicate_rows_raw,
-            args.blocks_table
-        )
-    })?;
-
-    if duplicate_rows == 0 {
+    if duplicate_rows == 0 || total_rows <= 1 {
         return Ok(None);
     }
 
-    let sample_query = format!(
-        "SELECT \
-            {col} AS block_number, \
-            count() AS occurrences \
-         FROM {table}{final_clause} \
-         GROUP BY {col} \
-         HAVING occurrences > 1 \
-         ORDER BY block_number \
-         LIMIT {limit}",
-        col = args.blocks_number_column,
-        table = args.blocks_table,
-        limit = DUPLICATE_SAMPLE_LIMIT + 1,
-        final_clause = final_clause
-    );
-
-    let mut rows: Vec<DuplicateSampleRow> = client.query(&sample_query).fetch_all().await?;
-    let truncated = rows.len() > DUPLICATE_SAMPLE_LIMIT;
-    if truncated {
-        rows.truncate(DUPLICATE_SAMPLE_LIMIT);
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct BlockNumberRow {
+        block_number: u64,
     }
 
-    let samples = rows
-        .into_iter()
-        .map(|row| BlockDuplicateEntry {
-            block_number: row.block_number,
-            occurrences: row.occurrences,
-        })
-        .collect();
+    let final_clause = final_clause(use_final);
+    let mut offset: u64 = 0;
+    let mut last_value: Option<u64> = None;
+    let mut run_length: u64 = 0;
+    let mut samples = Vec::new();
+    let mut truncated = false;
+
+    while offset < total_rows && !truncated {
+        if samples.len() >= DUPLICATE_SAMPLE_LIMIT {
+            truncated = true;
+            break;
+        }
+
+        let query = format!(
+            "SELECT {col} AS block_number \
+             FROM {table}{final_clause} \
+             ORDER BY {col} \
+             LIMIT {offset}, {limit}",
+            col = args.blocks_number_column,
+            table = args.blocks_table,
+            final_clause = final_clause,
+            offset = offset,
+            limit = DUPLICATE_SCAN_CHUNK
+        );
+
+        let rows: Vec<BlockNumberRow> = client.query(&query).fetch_all().await?;
+        if rows.is_empty() {
+            break;
+        }
+
+        offset = offset.checked_add(rows.len() as u64).ok_or_else(|| {
+            anyhow!("ブロックテーブルのオフセット計算でオーバーフローが発生しました")
+        })?;
+
+        'row_scan: for row in rows {
+            match last_value {
+                Some(value) if value == row.block_number => {
+                    run_length = run_length.saturating_add(1);
+                }
+                Some(value) => {
+                    if run_length > 1 {
+                        if samples.len() < DUPLICATE_SAMPLE_LIMIT {
+                            samples.push(BlockDuplicateEntry {
+                                block_number: value,
+                                occurrences: run_length,
+                            });
+                        } else {
+                            truncated = true;
+                            break 'row_scan;
+                        }
+                    }
+                    last_value = Some(row.block_number);
+                    run_length = 1;
+                }
+                None => {
+                    last_value = Some(row.block_number);
+                    run_length = 1;
+                }
+            }
+        }
+    }
+
+    if !truncated {
+        if let Some(value) = last_value {
+            if run_length > 1 {
+                if samples.len() < DUPLICATE_SAMPLE_LIMIT {
+                    samples.push(BlockDuplicateEntry {
+                        block_number: value,
+                        occurrences: run_length,
+                    });
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+    }
+
+    if samples.is_empty() && duplicate_rows > 0 {
+        truncated = true;
+    }
 
     Ok(Some(BlockDuplicateReport {
+        total_extra_rows: duplicate_rows,
+        samples,
+        truncated,
+    }))
+}
+
+async fn find_duplicate_transactions(
+    client: &Client,
+    args: &Args,
+    use_final: bool,
+    total_rows: u64,
+    duplicate_rows: u64,
+) -> Result<Option<TransactionDuplicateReport>> {
+    if duplicate_rows == 0 || total_rows <= 1 {
+        return Ok(None);
+    }
+
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct TxHashRow {
+        tx_hash: String,
+    }
+
+    let final_clause = final_clause(use_final);
+    let mut offset: u64 = 0;
+    let mut last_value: Option<String> = None;
+    let mut run_length: u64 = 0;
+    let mut samples = Vec::new();
+    let mut truncated = false;
+
+    while offset < total_rows && !truncated {
+        if samples.len() >= DUPLICATE_SAMPLE_LIMIT {
+            truncated = true;
+            break;
+        }
+
+        let query = format!(
+            "SELECT toString({col}) AS tx_hash \
+             FROM {table}{final_clause} \
+             ORDER BY {col} \
+             LIMIT {offset}, {limit}",
+            col = args.transactions_hash_column,
+            table = args.transactions_table,
+            final_clause = final_clause,
+            offset = offset,
+            limit = DUPLICATE_SCAN_CHUNK
+        );
+
+        let rows: Vec<TxHashRow> = client.query(&query).fetch_all().await?;
+        if rows.is_empty() {
+            break;
+        }
+
+        offset = offset.checked_add(rows.len() as u64).ok_or_else(|| {
+            anyhow!("トランザクションテーブルのオフセット計算でオーバーフローが発生しました")
+        })?;
+
+        'row_scan: for row in rows {
+            match &last_value {
+                Some(value) if value == &row.tx_hash => {
+                    run_length = run_length.saturating_add(1);
+                }
+                Some(value) => {
+                    if run_length > 1 {
+                        if samples.len() < DUPLICATE_SAMPLE_LIMIT {
+                            samples.push(TransactionDuplicateEntry {
+                                tx_hash: value.clone(),
+                                occurrences: run_length,
+                            });
+                        } else {
+                            truncated = true;
+                            break 'row_scan;
+                        }
+                    }
+                    last_value = Some(row.tx_hash);
+                    run_length = 1;
+                }
+                None => {
+                    last_value = Some(row.tx_hash);
+                    run_length = 1;
+                }
+            }
+        }
+    }
+
+    if !truncated {
+        if run_length > 1 {
+            if samples.len() < DUPLICATE_SAMPLE_LIMIT {
+                samples.push(TransactionDuplicateEntry {
+                    tx_hash: last_value
+                        .clone()
+                        .expect("run_length > 1 implies last_value is Some"),
+                    occurrences: run_length,
+                });
+            } else {
+                truncated = true;
+            }
+        }
+    }
+
+    if samples.is_empty() && duplicate_rows > 0 {
+        truncated = true;
+    }
+
+    Ok(Some(TransactionDuplicateReport {
         total_extra_rows: duplicate_rows,
         samples,
         truncated,
@@ -1096,6 +1284,36 @@ async fn fetch_mutation_info(client: &Client, tables: &[String]) -> Result<Vec<M
     }
 
     Ok(result)
+}
+
+async fn fetch_hash_column_stats(
+    client: &Client,
+    table: &str,
+    column: &str,
+    use_final: bool,
+) -> Result<Option<(u64, u64)>> {
+    #[derive(clickhouse::Row, serde::Deserialize)]
+    struct HashStatsRow {
+        distinct_values: u64,
+        total_rows: u64,
+    }
+
+    let final_clause = final_clause(use_final);
+    let query = format!(
+        "SELECT uniqExact({col}) AS distinct_values, count() AS total_rows \
+         FROM {table}{final_clause}",
+        col = column,
+        table = table,
+        final_clause = final_clause
+    );
+
+    let row: HashStatsRow = client.query(&query).fetch_one().await?;
+
+    if row.total_rows == 0 {
+        Ok(None)
+    } else {
+        Ok(Some((row.total_rows, row.distinct_values)))
+    }
 }
 
 async fn optimize_table(_client: &Client, table: &str) -> Result<()> {
@@ -2016,6 +2234,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
     println!("  5) Unfinished mutation count");
     println!("  6) Optimize blocks table (runs OPTIMIZE TABLE ... FINAL)");
     println!("  7) Optimize transactions table (runs OPTIMIZE TABLE ... FINAL)");
+    println!("  8) Duplicate transaction hash detection");
     println!("Enter numbers separated by commas (e.g. `1,3`) or press Enter for all:");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
@@ -2030,6 +2249,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         tx_gap: false,
         tx_mismatch: false,
         duplicates: false,
+        tx_duplicates: false,
         mutations: false,
         optimize_blocks: false,
         optimize_transactions: false,
@@ -2040,6 +2260,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         selection.tx_gap = true;
         selection.tx_mismatch = true;
         selection.duplicates = true;
+        selection.tx_duplicates = true;
         selection.mutations = true;
         selection.optimize_blocks = false;
         selection.optimize_transactions = false;
@@ -2073,11 +2294,19 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
             "7" | "optimize_tx" | "optimize_transactions" | "optimize-transactions" => {
                 selection.optimize_transactions = true;
             }
+            "8"
+            | "tx_duplicates"
+            | "duplicate_transactions"
+            | "duplicate-tx"
+            | "duplicate_hashes" => {
+                selection.tx_duplicates = true;
+            }
             "all" | "a" => {
                 selection.block_gap = true;
                 selection.tx_gap = true;
                 selection.tx_mismatch = true;
                 selection.duplicates = true;
+                selection.tx_duplicates = true;
                 selection.mutations = true;
                 selection.optimize_blocks = true;
                 selection.optimize_transactions = true;
@@ -2092,6 +2321,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         && !selection.tx_gap
         && !selection.tx_mismatch
         && !selection.duplicates
+        && !selection.tx_duplicates
         && !selection.mutations
         && !selection.optimize_blocks
         && !selection.optimize_transactions
