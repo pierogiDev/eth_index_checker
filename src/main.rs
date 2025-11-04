@@ -5,7 +5,7 @@ use alloy::eips::BlockNumberOrTag;
 use alloy::network::TransactionResponse;
 use alloy::primitives::{Signature, TxKind, B256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider};
-use alloy::rpc::types::eth::{Block as RpcBlock, Transaction as RpcTransaction};
+use alloy::rpc::types::eth::{Block as RpcBlock, SyncStatus, Transaction as RpcTransaction};
 use anyhow::{anyhow, bail, Context, Result};
 use clap::Parser;
 use clickhouse::Client;
@@ -168,6 +168,7 @@ struct SelectedChecks {
     mutations: bool,
     optimize_blocks: bool,
     optimize_transactions: bool,
+    sync_status: bool,
 }
 
 #[tokio::main]
@@ -245,6 +246,11 @@ async fn main() -> Result<()> {
     }
 
     let mut provider: Option<RootProvider> = None;
+
+    if checks.sync_status {
+        let provider_ref = ensure_provider(&mut provider, &args.eth_node_url)?;
+        report_sync_status(provider_ref).await?;
+    }
 
     let block_stats = match fetch_table_stats(
         &client,
@@ -377,7 +383,7 @@ async fn main() -> Result<()> {
 
             if !missing_ranges.is_empty() {
                 if prompt_fill_missing()? {
-                    println!("欠損ブロックをEthereumノードから取得し、ClickHouseに補完します。");
+                    println!("Fetching missing blocks from the Ethereum node and backfilling ClickHouse.");
                     let provider_ref = ensure_provider(&mut provider, &args.eth_node_url)?;
                     fill_missing_blocks_and_transactions(
                         &client,
@@ -389,7 +395,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 } else {
-                    println!("ユーザー入力により欠損データの補完をスキップしました。");
+                    println!("Skipped backfilling missing data based on user choice.");
                 }
             }
         }
@@ -501,7 +507,7 @@ async fn main() -> Result<()> {
                 );
             }
             if prompt_repair_mismatches()? {
-                println!("検出された不整合ブロックをEthereumノードのデータで補修します。");
+                println!("Repairing mismatched blocks using data from the Ethereum node.");
                 repair_transaction_mismatches(
                     &client,
                     provider_ref,
@@ -512,7 +518,7 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             } else {
-                println!("ユーザー入力によりトランザクション補修をスキップしました。");
+                println!("Skipped repairing transaction mismatches based on user choice.");
             }
         }
     }
@@ -750,7 +756,7 @@ async fn find_duplicate_blocks(
         }
 
         offset = offset.checked_add(rows.len() as u64).ok_or_else(|| {
-            anyhow!("ブロックテーブルのオフセット計算でオーバーフローが発生しました")
+            anyhow!("Overflow while computing offset during block table duplicate scan")
         })?;
 
         'row_scan: for row in rows {
@@ -854,7 +860,7 @@ async fn find_duplicate_transactions(
         }
 
         offset = offset.checked_add(rows.len() as u64).ok_or_else(|| {
-            anyhow!("トランザクションテーブルのオフセット計算でオーバーフローが発生しました")
+            anyhow!("Overflow while computing offset during transaction table duplicate scan")
         })?;
 
         'row_scan: for row in rows {
@@ -1146,7 +1152,7 @@ async fn cleanup_mutations(client: &Client, args: &Args) -> Result<()> {
         if prompt_yes_no(&format!("Run `OPTIMIZE TABLE {} FINAL` now?", table))? {
             optimize_table(client, &table).await?;
             println!(
-                "  読み取り専用モードのため、`OPTIMIZE TABLE {} FINAL` は実行されませんでした。",
+                "  Skipped `OPTIMIZE TABLE {} FINAL` because read-only mode is enabled.",
                 table
             );
         }
@@ -1318,7 +1324,7 @@ async fn fetch_hash_column_stats(
 
 async fn optimize_table(_client: &Client, table: &str) -> Result<()> {
     info!(
-        "読み取り専用モードのため、`OPTIMIZE TABLE {} FINAL` を実行しません。",
+        "Skipping `OPTIMIZE TABLE {} FINAL` because read-only mode is enabled.",
         table
     );
     Ok(())
@@ -1326,7 +1332,7 @@ async fn optimize_table(_client: &Client, table: &str) -> Result<()> {
 
 async fn optimize_blocks_table(client: &Client, args: &Args) -> Result<()> {
     println!(
-        "ブロックテーブル `{}` に対して `OPTIMIZE TABLE ... FINAL` を発行します。",
+        "Issuing `OPTIMIZE TABLE ... FINAL` for blocks table `{}`.",
         args.blocks_table
     );
     let query = format!("OPTIMIZE TABLE {} FINAL", args.blocks_table);
@@ -1338,7 +1344,7 @@ async fn optimize_blocks_table(client: &Client, args: &Args) -> Result<()> {
         )
     })?;
     println!(
-        "`OPTIMIZE TABLE {} FINAL` を送信しました。ClickHouse側の処理完了を確認してください。",
+        "Submitted `OPTIMIZE TABLE {} FINAL`; confirm completion on ClickHouse.",
         args.blocks_table
     );
     Ok(())
@@ -1346,7 +1352,7 @@ async fn optimize_blocks_table(client: &Client, args: &Args) -> Result<()> {
 
 async fn optimize_transactions_table(client: &Client, args: &Args) -> Result<()> {
     println!(
-        "トランザクションテーブル `{}` に対して `OPTIMIZE TABLE ... FINAL` を発行します。",
+        "Issuing `OPTIMIZE TABLE ... FINAL` for transactions table `{}`.",
         args.transactions_table
     );
     let query = format!("OPTIMIZE TABLE {} FINAL", args.transactions_table);
@@ -1358,7 +1364,7 @@ async fn optimize_transactions_table(client: &Client, args: &Args) -> Result<()>
         )
     })?;
     println!(
-        "`OPTIMIZE TABLE {} FINAL` を送信しました。ClickHouse側の処理完了を確認してください。",
+        "Submitted `OPTIMIZE TABLE {} FINAL`; confirm completion on ClickHouse.",
         args.transactions_table
     );
     Ok(())
@@ -1370,7 +1376,7 @@ async fn run_targeted_deletes(
     _column: &str,
 ) -> Result<Vec<(u64, u64)>> {
     println!(
-        "読み取り専用モードのため、テーブル `{}` に対する DELETE キューイングはスキップします。",
+        "Skipping DELETE queueing for table `{}` because read-only mode is enabled.",
         table
     );
     Ok(Vec::new())
@@ -1449,6 +1455,57 @@ async fn fetch_table_columns(client: &Client, table: &str) -> Result<Vec<ColumnI
         .collect())
 }
 
+async fn report_sync_status(provider: &RootProvider) -> Result<()> {
+    println!("Checking Ethereum node sync status...");
+    let status = provider
+        .syncing()
+        .await
+        .context("Failed to query Ethereum node for sync status")?;
+
+    match status {
+        SyncStatus::None => {
+            println!("Ethereum node is fully synchronized.");
+        }
+        SyncStatus::Info(info) => {
+            let info = info.as_ref();
+            println!("Ethereum node is still syncing:");
+            println!("  Starting block: {}", info.starting_block);
+            println!("  Current block: {}", info.current_block);
+            println!("  Highest block: {}", info.highest_block);
+
+            match (
+                info.warp_chunks_processed.as_ref(),
+                info.warp_chunks_amount.as_ref(),
+            ) {
+                (Some(processed), Some(total)) => {
+                    println!("  Warp sync chunks processed: {}/{}", processed, total);
+                }
+                (Some(processed), None) => {
+                    println!("  Warp sync chunks processed: {}", processed);
+                }
+                (None, Some(total)) => {
+                    println!("  Warp sync total chunks: {}", total);
+                }
+                (None, None) => {}
+            }
+
+            if let Some(stages) = info.stages.as_ref() {
+                if !stages.is_empty() {
+                    println!("  Stage progress (showing up to 5 entries):");
+                    for stage in stages.iter().take(5) {
+                        println!("    {}: {}", stage.name, stage.block);
+                    }
+                    if stages.len() > 5 {
+                        println!("    ...{} more stage(s)", stages.len() - 5);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn ensure_provider<'a>(
     provider: &'a mut Option<RootProvider>,
     eth_node_url: &str,
@@ -1466,7 +1523,7 @@ fn ensure_provider<'a>(
 }
 
 fn prompt_fill_missing() -> Result<bool> {
-    println!("検出された欠損ブロックを補完しますか？ (y/N)");
+    println!("Backfill missing blocks from the Ethereum node? (y/N)");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
 
@@ -1476,12 +1533,12 @@ fn prompt_fill_missing() -> Result<bool> {
         .context("Failed to read confirmation for filling missing blocks")?;
 
     let normalized = input.trim().to_lowercase();
-    let decision = matches!(normalized.as_str(), "y" | "yes" | "1" | "true" | "はい");
+    let decision = matches!(normalized.as_str(), "y" | "yes" | "1" | "true");
     Ok(decision)
 }
 
 fn prompt_repair_mismatches() -> Result<bool> {
-    println!("検出されたトランザクション不整合を補修しますか？ (y/N)");
+    println!("Repair transaction mismatches using Ethereum node data? (y/N)");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
 
@@ -1491,7 +1548,7 @@ fn prompt_repair_mismatches() -> Result<bool> {
         .context("Failed to read confirmation for repairing mismatched transactions")?;
 
     let normalized = input.trim().to_lowercase();
-    let decision = matches!(normalized.as_str(), "y" | "yes" | "1" | "true" | "はい");
+    let decision = matches!(normalized.as_str(), "y" | "yes" | "1" | "true");
     Ok(decision)
 }
 
@@ -1541,15 +1598,15 @@ async fn repair_transaction_mismatches(
         let span = end
             .checked_sub(start)
             .and_then(|diff| diff.checked_add(1))
-            .ok_or_else(|| anyhow!("ブロック範囲 {}-{} のサイズ計算に失敗しました", start, end))?;
+            .ok_or_else(|| anyhow!("Failed to compute size for block range {}-{}", start, end))?;
         acc.checked_add(span)
-            .ok_or_else(|| anyhow!("補修対象ブロック数の合計がオーバーフローしました"))
+            .ok_or_else(|| anyhow!("Total number of blocks to repair overflowed"))
     })?;
 
     println!(
-        "トランザクション不整合 {} 件に対応する {} ブロックを再投入します。",
-        mismatches.len(),
-        total_blocks
+        "Replaying {total_blocks} block(s) to resolve {mismatch_count} transaction mismatch(es).",
+        total_blocks = total_blocks,
+        mismatch_count = mismatches.len()
     );
 
     fill_missing_blocks_and_transactions(client, provider, args, block_columns, tx_columns, &ranges)
@@ -1571,26 +1628,24 @@ async fn fill_missing_blocks_and_transactions(
     let block_insert_columns = select_block_insert_columns(block_columns);
     if block_insert_columns.is_empty() {
         bail!(
-            "ブロックテーブル `{}` に補完で利用可能なカラムが見つかりません。",
+            "No compatible columns found in blocks table `{}` for backfilling.",
             args.blocks_table
         );
     }
 
     let tx_insert_columns = select_transaction_insert_columns(tx_columns);
     if tx_columns.is_empty() {
-        info!("トランザクションテーブルのスキーマ情報が空です。トランザクション補完をスキップします。");
+        info!("Transaction table schema is empty; skipping transaction backfill.");
     } else if tx_insert_columns.is_empty() {
         println!(
-            "トランザクションテーブル `{}` に対応可能なカラムがないため、トランザクション補完をスキップします。",
+            "Skipping transaction backfill for table `{}` because no compatible columns were found.",
             args.transactions_table
         );
-        info!(
-            "transactions テーブルに対応する補完カラムが存在しないため INSERT をスキップします。"
-        );
+        info!("Skipping INSERT for transactions table because no compatible columns exist.");
     }
 
     println!(
-        "欠損範囲 {} 件について Ethereum ノードから再取得し ClickHouse に補完します。",
+        "Backfilling {} missing range(s) from the Ethereum node into ClickHouse.",
         missing_ranges.len()
     );
 
@@ -1598,7 +1653,7 @@ async fn fill_missing_blocks_and_transactions(
     let mut total_transactions_inserted = 0usize;
 
     for &(start, end) in missing_ranges {
-        println!("ブロック範囲 {}-{} を補完中...", start, end);
+        println!("Backfilling block range {}-{}...", start, end);
         let mut block_rows: Vec<Vec<String>> = Vec::new();
         let mut tx_rows: Vec<Vec<String>> = Vec::new();
         let mut range_blocks_inserted = 0usize;
@@ -1626,7 +1681,7 @@ async fn fill_missing_blocks_and_transactions(
                 .await
                 .with_context(|| {
                     format!(
-                        "ClickHouse へのブロック INSERT に失敗しました (範囲 {}-{})",
+                        "Failed to insert blocks into ClickHouse (range {}-{})",
                         start, end
                     )
                 })?;
@@ -1647,7 +1702,7 @@ async fn fill_missing_blocks_and_transactions(
                     .await
                     .with_context(|| {
                         format!(
-                            "ClickHouse へのトランザクション INSERT に失敗しました (範囲 {}-{})",
+                            "Failed to insert transactions into ClickHouse (range {}-{})",
                             start, end
                         )
                     })?;
@@ -1669,7 +1724,7 @@ async fn fill_missing_blocks_and_transactions(
             .await
             .with_context(|| {
                 format!(
-                    "ClickHouse へのブロック INSERT に失敗しました (範囲 {}-{})",
+                    "Failed to insert blocks into ClickHouse (range {}-{})",
                     start, end
                 )
             })?;
@@ -1688,7 +1743,7 @@ async fn fill_missing_blocks_and_transactions(
             .await
             .with_context(|| {
                 format!(
-                    "ClickHouse へのトランザクション INSERT に失敗しました (範囲 {}-{})",
+                    "Failed to insert transactions into ClickHouse (range {}-{})",
                     start, end
                 )
             })?;
@@ -1697,13 +1752,13 @@ async fn fill_missing_blocks_and_transactions(
         }
 
         println!(
-            "  補完完了: ブロック {} 件、トランザクション {} 件",
+            "  Completed backfill: {} block(s), {} transaction(s)",
             range_blocks_inserted, range_tx_inserted
         );
     }
 
     println!(
-        "欠損データの補完が完了しました (合計: ブロック {} 件、トランザクション {} 件)。",
+        "Finished backfilling missing data (total: {} block(s), {} transaction(s)).",
         total_blocks_inserted, total_transactions_inserted
     );
     Ok(())
@@ -1728,8 +1783,8 @@ async fn load_block(provider: &impl Provider, number: u64) -> Result<RpcBlock> {
         .get_block_by_number(BlockNumberOrTag::Number(number))
         .full()
         .await
-        .with_context(|| format!("ブロック {number} の取得に失敗しました"))?
-        .ok_or_else(|| anyhow!("Ethereum ノードからブロック {number} が取得できませんでした"))
+        .with_context(|| format!("Failed to load block {number} from the Ethereum node"))?
+        .ok_or_else(|| anyhow!("Ethereum node returned no data for block {number}"))
 }
 
 fn render_block_row(block: &RpcBlock, columns: &[&ColumnInfo]) -> Result<Vec<String>> {
@@ -1817,7 +1872,7 @@ fn render_block_value(column: &ColumnInfo, block: &RpcBlock) -> Result<String> {
         },
         "version" => "now()".to_string(),
         other => {
-            bail!("ブロックカラム `{}` は補完対象に対応していません", other);
+            bail!("Block column `{}` is not supported for backfilling", other);
         }
     };
 
@@ -1831,7 +1886,7 @@ fn render_transaction_rows(block: &RpcBlock, columns: &[&ColumnInfo]) -> Result<
 
     let Some(transactions) = block.transactions.as_transactions() else {
         bail!(
-            "ブロック {} のトランザクションがハッシュのみで返却されました。full() 指定で取得できていない可能性があります。",
+            "Block {} returned only transaction hashes; enable full() in the RPC call.",
             block.header.number()
         );
     };
@@ -1966,7 +2021,7 @@ fn render_transaction_value(
         "version" => "now()".to_string(),
         other => {
             bail!(
-                "トランザクションカラム `{}` は補完対象に対応していません",
+                "Transaction column `{}` is not supported for backfilling",
                 other
             );
         }
@@ -2008,7 +2063,7 @@ async fn insert_rows(
         .query(&sql)
         .execute()
         .await
-        .with_context(|| format!("クエリ `{}` の実行に失敗しました", sql))
+        .with_context(|| format!("Failed to execute query `{}`", sql))
 }
 
 fn sql_identifier(identifier: &str) -> String {
@@ -2235,6 +2290,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
     println!("  6) Optimize blocks table (runs OPTIMIZE TABLE ... FINAL)");
     println!("  7) Optimize transactions table (runs OPTIMIZE TABLE ... FINAL)");
     println!("  8) Duplicate transaction hash detection");
+    println!("  9) Fetch Ethereum node sync status");
     println!("Enter numbers separated by commas (e.g. `1,3`) or press Enter for all:");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
@@ -2253,6 +2309,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         mutations: false,
         optimize_blocks: false,
         optimize_transactions: false,
+        sync_status: false,
     };
 
     if read == 0 || input.trim().is_empty() {
@@ -2264,6 +2321,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         selection.mutations = true;
         selection.optimize_blocks = false;
         selection.optimize_transactions = false;
+        selection.sync_status = true;
         return Ok(selection);
     }
 
@@ -2301,6 +2359,9 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
             | "duplicate_hashes" => {
                 selection.tx_duplicates = true;
             }
+            "9" | "sync" | "sync_status" | "syncing" | "eth_sync" => {
+                selection.sync_status = true;
+            }
             "all" | "a" => {
                 selection.block_gap = true;
                 selection.tx_gap = true;
@@ -2310,6 +2371,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
                 selection.mutations = true;
                 selection.optimize_blocks = true;
                 selection.optimize_transactions = true;
+                selection.sync_status = true;
             }
             other => {
                 bail!("Unknown selection: `{}`", other);
@@ -2325,6 +2387,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         && !selection.mutations
         && !selection.optimize_blocks
         && !selection.optimize_transactions
+        && !selection.sync_status
     {
         bail!("No checks selected.");
     }
