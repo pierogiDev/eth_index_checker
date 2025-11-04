@@ -15,3 +15,5 @@ screenlog.*
 
 # Others
 /target_local/
+
+/.idea/
