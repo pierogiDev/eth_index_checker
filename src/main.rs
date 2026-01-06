@@ -343,8 +343,7 @@ async fn main() -> Result<()> {
     if checks.duplicates && block_stats.total_rows > block_stats.distinct_count {
         let duplicate_rows = block_stats
             .total_rows
-            .checked_sub(block_stats.distinct_count)
-            .unwrap_or(0);
+            .saturating_sub(block_stats.distinct_count);
         println!("Warning: found {} duplicate block rows.", duplicate_rows);
         if let Some(duplicates) = find_duplicate_blocks(
             &client,
@@ -1115,18 +1114,16 @@ async fn find_duplicate_hashes(
         }
     }
 
-    if !truncated {
-        if run_length > 1 {
-            if samples.len() < DUPLICATE_SAMPLE_LIMIT {
-                samples.push(HashDuplicateEntry {
-                    hash_value: last_value
-                        .clone()
-                        .expect("run_length > 1 implies last_value is Some"),
-                    occurrences: run_length,
-                });
-            } else {
-                truncated = true;
-            }
+    if !truncated && run_length > 1 {
+        if samples.len() < DUPLICATE_SAMPLE_LIMIT {
+            samples.push(HashDuplicateEntry {
+                hash_value: last_value
+                    .clone()
+                    .expect("run_length > 1 implies last_value is Some"),
+                occurrences: run_length,
+            });
+        } else {
+            truncated = true;
         }
     }
 
@@ -1988,14 +1985,14 @@ async fn fill_missing_blocks_and_transactions(
     Ok(())
 }
 
-fn select_block_insert_columns<'a>(columns: &'a [ColumnInfo]) -> Vec<&'a ColumnInfo> {
+fn select_block_insert_columns(columns: &[ColumnInfo]) -> Vec<&ColumnInfo> {
     columns
         .iter()
         .filter(|column| is_supported_block_column(&column.name))
         .collect()
 }
 
-fn select_transaction_insert_columns<'a>(columns: &'a [ColumnInfo]) -> Vec<&'a ColumnInfo> {
+fn select_transaction_insert_columns(columns: &[ColumnInfo]) -> Vec<&ColumnInfo> {
     columns
         .iter()
         .filter(|column| is_supported_transaction_column(&column.name))
