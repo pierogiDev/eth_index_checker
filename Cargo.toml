@@ -6,15 +6,15 @@ build = "build.rs"
 
 [dependencies]
 anyhow = "1.0.100"
-clap = { version = "4.5.50", features = ["derive", "env"] }
-clickhouse = { version = "0.14.0", default-features = false, features = ["lz4"] }
+clap = { version = "4.5.54", features = ["derive", "env"] }
+clickhouse = { version = "0.14.1", default-features = false, features = ["lz4"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.132"
-tokio = { version = "1.48.0", features = ["rt-multi-thread", "macros"] }
-alloy = { version = "1.0.41", default-features = false, features = ["provider-http", "reqwest-rustls-tls", "rpc-types"] }
-reqwest = { version = "0.12.24", default-features = false, features = ["rustls-tls"] }
+serde_json = "1.0.148"
+tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros"] }
+alloy = { version = "1.2.1", default-features = false, features = ["provider-http", "reqwest-rustls-tls", "rpc-types"] }
+reqwest = { version = "0.13.1", default-features = false, features = ["rustls"] }
 env_logger = "0.11.8"
-log = "0.4.28"
+log = "0.4.29"
 
 [profile.dev]
 opt-level = 1
