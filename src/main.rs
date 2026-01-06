@@ -65,6 +65,19 @@ struct Args {
     /// Column name that stores the transaction hash in the transactions table
     #[arg(long, env = "TRANSACTIONS_HASH_COLUMN", default_value = "hash")]
     transactions_hash_column: String,
+    /// Receipts table name
+    #[arg(long, env = "RECEIPTS_TABLE", default_value = "receipts")]
+    receipts_table: String,
+    /// Column name that stores the block number in the receipts table
+    #[arg(long, env = "RECEIPTS_BLOCK_COLUMN", default_value = "block_number")]
+    receipts_block_column: String,
+    /// Column name that stores the transaction hash in the receipts table
+    #[arg(
+        long,
+        env = "RECEIPTS_HASH_COLUMN",
+        default_value = "transaction_hash"
+    )]
+    receipts_hash_column: String,
     /// Ethereum node RPC endpoint
     #[arg(long, env = "ETH_NODE_URL", default_value = DEFAULT_ETH_NODE_URL)]
     eth_node_url: String,
@@ -105,15 +118,15 @@ struct BlockDuplicateEntry {
 }
 
 #[derive(Debug)]
-struct TransactionDuplicateReport {
+struct HashDuplicateReport {
     total_extra_rows: u64,
-    samples: Vec<TransactionDuplicateEntry>,
+    samples: Vec<HashDuplicateEntry>,
     truncated: bool,
 }
 
 #[derive(Debug)]
-struct TransactionDuplicateEntry {
-    tx_hash: String,
+struct HashDuplicateEntry {
+    hash_value: String,
     occurrences: u64,
 }
 
@@ -162,13 +175,16 @@ struct TableMetadata {
 struct SelectedChecks {
     block_gap: bool,
     tx_gap: bool,
+    receipts_gap: bool,
     tx_mismatch: bool,
     duplicates: bool,
     tx_duplicates: bool,
+    receipts_duplicates: bool,
     mutations: bool,
     optimize_blocks: bool,
     optimize_transactions: bool,
     sync_status: bool,
+    show_schema: bool,
 }
 
 #[tokio::main]
@@ -189,8 +205,21 @@ async fn main() -> Result<()> {
         .with_password(&args.password)
         .with_database(&args.database);
 
-    let block_columns = print_table_schema(&client, &args.blocks_table, "blocks").await?;
-    let tx_columns = print_table_schema(&client, &args.transactions_table, "transactions").await?;
+    let block_columns = fetch_table_columns(&client, &args.blocks_table).await?;
+    let tx_columns = fetch_table_columns(&client, &args.transactions_table).await?;
+    let needs_receipts_columns =
+        checks.receipts_gap || checks.receipts_duplicates || checks.show_schema;
+    let receipts_columns = if needs_receipts_columns {
+        fetch_table_columns(&client, &args.receipts_table).await?
+    } else {
+        Vec::new()
+    };
+
+    if checks.show_schema {
+        print_columns(&block_columns, &args.blocks_table, "blocks");
+        print_columns(&tx_columns, &args.transactions_table, "transactions");
+        print_columns(&receipts_columns, &args.receipts_table, "receipts");
+    }
 
     let blocks_meta = fetch_table_metadata(&client, &args.blocks_table).await?;
     if blocks_meta.apply_final {
@@ -222,6 +251,26 @@ async fn main() -> Result<()> {
         }
     }
 
+    let receipts_meta = if checks.receipts_gap || checks.receipts_duplicates {
+        let meta = fetch_table_metadata(&client, &args.receipts_table).await?;
+        if meta.apply_final {
+            if let Some(engine) = &meta.engine {
+                println!(
+                    "Table `{}` uses engine `{}`; applying FINAL for consistency.",
+                    args.receipts_table, engine
+                );
+            } else {
+                println!(
+                    "Table `{}` requires FINAL for consistent reads; applying FINAL.",
+                    args.receipts_table
+                );
+            }
+        }
+        Some(meta)
+    } else {
+        None
+    };
+
     ensure_column_exists(
         &block_columns,
         &args.blocks_number_column,
@@ -240,6 +289,22 @@ async fn main() -> Result<()> {
         &args.transactions_table,
         "--transactions-hash-column",
     )?;
+    if checks.receipts_gap {
+        ensure_column_exists(
+            &receipts_columns,
+            &args.receipts_block_column,
+            &args.receipts_table,
+            "--receipts-block-column",
+        )?;
+    }
+    if checks.receipts_duplicates {
+        ensure_column_exists(
+            &receipts_columns,
+            &args.receipts_hash_column,
+            &args.receipts_table,
+            "--receipts-hash-column",
+        )?;
+    }
 
     if checks.mutations {
         report_unfinished_mutations(&client).await?;
@@ -330,12 +395,14 @@ async fn main() -> Result<()> {
                         "No duplicate transaction hashes found in table `{}`.",
                         args.transactions_table
                     );
-                } else if let Some(duplicates) = find_duplicate_transactions(
+                } else if let Some(duplicates) = find_duplicate_hashes(
                     &client,
-                    &args,
+                    &args.transactions_table,
+                    &args.transactions_hash_column,
                     tx_meta.apply_final,
                     total_rows,
                     duplicate_rows,
+                    "transaction hash",
                 )
                 .await?
                 {
@@ -345,11 +412,68 @@ async fn main() -> Result<()> {
                         duplicates.samples.len()
                     );
                     for entry in &duplicates.samples {
-                        println!("  tx {} appears {} times", entry.tx_hash, entry.occurrences);
+                        println!(
+                            "  tx {} appears {} times",
+                            entry.hash_value, entry.occurrences
+                        );
                     }
                     if duplicates.truncated {
                         println!(
                             "  ...and more (showing first {} transaction hash(es)).",
+                            DUPLICATE_SAMPLE_LIMIT
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if checks.receipts_duplicates {
+        let receipts_apply_final = receipts_meta
+            .as_ref()
+            .expect("receipts_meta must exist when receipts checks run")
+            .apply_final;
+        match fetch_hash_column_stats(
+            &client,
+            &args.receipts_table,
+            &args.receipts_hash_column,
+            receipts_apply_final,
+        )
+        .await?
+        {
+            None => println!("No receipts found in table `{}`.", args.receipts_table),
+            Some((total_rows, distinct_values)) => {
+                let duplicate_rows = total_rows.saturating_sub(distinct_values);
+                if duplicate_rows == 0 {
+                    println!(
+                        "No duplicate receipt hashes found in table `{}`.",
+                        args.receipts_table
+                    );
+                } else if let Some(duplicates) = find_duplicate_hashes(
+                    &client,
+                    &args.receipts_table,
+                    &args.receipts_hash_column,
+                    receipts_apply_final,
+                    total_rows,
+                    duplicate_rows,
+                    "receipt hash",
+                )
+                .await?
+                {
+                    println!(
+                        "Detected {} duplicate receipt occurrence(s) across {} hash(es):",
+                        duplicates.total_extra_rows,
+                        duplicates.samples.len()
+                    );
+                    for entry in &duplicates.samples {
+                        println!(
+                            "  receipt {} appears {} times",
+                            entry.hash_value, entry.occurrences
+                        );
+                    }
+                    if duplicates.truncated {
+                        println!(
+                            "  ...and more (showing first {} receipt hash(es)).",
                             DUPLICATE_SAMPLE_LIMIT
                         );
                     }
@@ -481,6 +605,96 @@ async fn main() -> Result<()> {
         }
     }
 
+    if checks.receipts_gap {
+        let receipts_apply_final = receipts_meta
+            .as_ref()
+            .expect("receipts_meta must exist when receipts checks run")
+            .apply_final;
+        info!(
+            "Starting receipts table gap detection for `{}` (block column = `{}`).",
+            args.receipts_table, args.receipts_block_column
+        );
+        match fetch_table_stats(
+            &client,
+            &args.receipts_table,
+            &args.receipts_block_column,
+            receipts_apply_final,
+        )
+        .await?
+        {
+            None => {
+                info!(
+                    "Receipts table `{}` returned no rows; skipping gap detection.",
+                    args.receipts_table
+                );
+                println!(
+                    "No receipts found in table `{}`. Skipping receipts gap check.",
+                    args.receipts_table
+                );
+            }
+            Some(receipts_stats) => {
+                info!(
+                    "Loaded receipts stats: range {}…{}, {} distinct block number(s), {} total row(s).",
+                    receipts_stats.min,
+                    receipts_stats.max,
+                    receipts_stats.distinct_count,
+                    receipts_stats.total_rows
+                );
+                println!(
+                    "Receipts block range: {}…{} ({} distinct block numbers, {} total rows)",
+                    receipts_stats.min,
+                    receipts_stats.max,
+                    receipts_stats.distinct_count,
+                    receipts_stats.total_rows
+                );
+                let span = receipts_stats
+                    .max
+                    .checked_sub(receipts_stats.min)
+                    .context("Receipts block number range is invalid")?;
+                let expected_blocks = span
+                    .checked_add(1)
+                    .context("Receipts block number range overflow")?;
+                if expected_blocks == receipts_stats.distinct_count {
+                    info!(
+                        "No receipts block gaps detected between {} and {} in `{}`.",
+                        receipts_stats.min, receipts_stats.max, args.receipts_table
+                    );
+                    println!(
+                        "No gaps detected between {} and {} in receipts table `{}`.",
+                        receipts_stats.min, receipts_stats.max, args.receipts_table
+                    );
+                } else {
+                    info!(
+                        "Scanning `{}` for missing receipts block ranges...",
+                        args.receipts_table
+                    );
+                    let missing_ranges = find_missing_ranges(
+                        &client,
+                        &args.receipts_table,
+                        &args.receipts_block_column,
+                        receipts_apply_final,
+                    )
+                    .await?;
+                    let missing_total: u64 = missing_ranges
+                        .iter()
+                        .map(|(start, end)| if end < start { 0 } else { end - start + 1 })
+                        .sum();
+                    info!(
+                        "Detected {} missing receipts block(s) across {} gap(s).",
+                        missing_total,
+                        missing_ranges.len()
+                    );
+                    let context = format!("receipts table `{}`", args.receipts_table);
+                    report_missing_ranges(&missing_ranges, &context);
+                    info!(
+                        "Finished receipts gap detection for `{}`.",
+                        args.receipts_table
+                    );
+                }
+            }
+        }
+    }
+
     if checks.tx_mismatch {
         let provider_ref = ensure_provider(&mut provider, &args.eth_node_url)?;
         let mismatches = find_transaction_mismatches(
@@ -547,6 +761,12 @@ fn validate_identifiers(args: &Args) -> Result<()> {
         "transactions.block_number column",
     )?;
     ensure_identifier(&args.transactions_hash_column, "transactions.hash column")?;
+    ensure_identifier(&args.receipts_table, "receipts table name")?;
+    ensure_identifier(
+        &args.receipts_block_column,
+        "receipts.block_number column",
+    )?;
+    ensure_identifier(&args.receipts_hash_column, "receipts.hash column")?;
     Ok(())
 }
 
@@ -813,20 +1033,22 @@ async fn find_duplicate_blocks(
     }))
 }
 
-async fn find_duplicate_transactions(
+async fn find_duplicate_hashes(
     client: &Client,
-    args: &Args,
+    table: &str,
+    column: &str,
     use_final: bool,
     total_rows: u64,
     duplicate_rows: u64,
-) -> Result<Option<TransactionDuplicateReport>> {
+    label: &str,
+) -> Result<Option<HashDuplicateReport>> {
     if duplicate_rows == 0 || total_rows <= 1 {
         return Ok(None);
     }
 
     #[derive(clickhouse::Row, serde::Deserialize)]
     struct TxHashRow {
-        tx_hash: String,
+        hash_value: String,
     }
 
     let final_clause = final_clause(use_final);
@@ -843,12 +1065,12 @@ async fn find_duplicate_transactions(
         }
 
         let query = format!(
-            "SELECT toString({col}) AS tx_hash \
+            "SELECT toString({col}) AS hash_value \
              FROM {table}{final_clause} \
              ORDER BY {col} \
              LIMIT {offset}, {limit}",
-            col = args.transactions_hash_column,
-            table = args.transactions_table,
+            col = column,
+            table = table,
             final_clause = final_clause,
             offset = offset,
             limit = DUPLICATE_SCAN_CHUNK
@@ -860,19 +1082,21 @@ async fn find_duplicate_transactions(
         }
 
         offset = offset.checked_add(rows.len() as u64).ok_or_else(|| {
-            anyhow!("Overflow while computing offset during transaction table duplicate scan")
+            anyhow!(
+                "Overflow while computing offset during {label} duplicate scan"
+            )
         })?;
 
         'row_scan: for row in rows {
             match &last_value {
-                Some(value) if value == &row.tx_hash => {
+                Some(value) if value == &row.hash_value => {
                     run_length = run_length.saturating_add(1);
                 }
                 Some(value) => {
                     if run_length > 1 {
                         if samples.len() < DUPLICATE_SAMPLE_LIMIT {
-                            samples.push(TransactionDuplicateEntry {
-                                tx_hash: value.clone(),
+                            samples.push(HashDuplicateEntry {
+                                hash_value: value.clone(),
                                 occurrences: run_length,
                             });
                         } else {
@@ -880,11 +1104,11 @@ async fn find_duplicate_transactions(
                             break 'row_scan;
                         }
                     }
-                    last_value = Some(row.tx_hash);
+                    last_value = Some(row.hash_value);
                     run_length = 1;
                 }
                 None => {
-                    last_value = Some(row.tx_hash);
+                    last_value = Some(row.hash_value);
                     run_length = 1;
                 }
             }
@@ -894,8 +1118,8 @@ async fn find_duplicate_transactions(
     if !truncated {
         if run_length > 1 {
             if samples.len() < DUPLICATE_SAMPLE_LIMIT {
-                samples.push(TransactionDuplicateEntry {
-                    tx_hash: last_value
+                samples.push(HashDuplicateEntry {
+                    hash_value: last_value
                         .clone()
                         .expect("run_length > 1 implies last_value is Some"),
                     occurrences: run_length,
@@ -910,7 +1134,7 @@ async fn find_duplicate_transactions(
         truncated = true;
     }
 
-    Ok(Some(TransactionDuplicateReport {
+    Ok(Some(HashDuplicateReport {
         total_extra_rows: duplicate_rows,
         samples,
         truncated,
@@ -2184,8 +2408,7 @@ fn extract_signature(tx: &RpcTransaction) -> Option<&Signature> {
     }
 }
 
-async fn print_table_schema(client: &Client, table: &str, label: &str) -> Result<Vec<ColumnInfo>> {
-    let columns = fetch_table_columns(client, table).await?;
+fn print_columns(columns: &[ColumnInfo], table: &str, label: &str) {
     if columns.is_empty() {
         println!(
             "Table `{}` ({}) has no columns or does not exist.",
@@ -2193,11 +2416,10 @@ async fn print_table_schema(client: &Client, table: &str, label: &str) -> Result
         );
     } else {
         println!("Table `{}` ({}) columns:", table, label);
-        for column in &columns {
+        for column in columns {
             println!("  {} {}", column.name, column.column_type);
         }
     }
-    Ok(columns)
 }
 
 async fn report_unfinished_mutations(client: &Client) -> Result<()> {
@@ -2282,16 +2504,24 @@ fn init_logging() {
 
 fn prompt_check_selection() -> Result<SelectedChecks> {
     println!("Select checks to run:");
+    println!("Data integrity:");
     println!("  1) Block gap detection");
-    println!("  2) Transaction mismatch detection");
-    println!("  3) Duplicate block detection");
-    println!("  4) Transaction table gap detection");
-    println!("  5) Unfinished mutation count");
-    println!("  6) Optimize blocks table (runs OPTIMIZE TABLE ... FINAL)");
-    println!("  7) Optimize transactions table (runs OPTIMIZE TABLE ... FINAL)");
-    println!("  8) Duplicate transaction hash detection");
-    println!("  9) Fetch Ethereum node sync status");
-    println!("Enter numbers separated by commas (e.g. `1,3`) or press Enter for all:");
+    println!("  2) Transaction table gap detection");
+    println!("  3) Receipts table gap detection");
+    println!("  4) Transaction count mismatch detection");
+    println!("Duplicates:");
+    println!("  5) Duplicate block detection");
+    println!("  6) Duplicate transaction hash detection");
+    println!("  7) Duplicate receipt hash detection");
+    println!("Operations:");
+    println!("  8) Unfinished mutation count");
+    println!("  9) Show table columns");
+    println!("  10) Optimize both tables (blocks + transactions)");
+    println!("  11) Optimize blocks table only");
+    println!("  12) Optimize transactions table only");
+    println!("Node status:");
+    println!("  13) Fetch Ethereum node sync status");
+    println!("Enter numbers separated by commas (e.g. `1,5`) or press Enter for defaults:");
     print!("> ");
     io::stdout().flush().context("Failed to flush stdout")?;
 
@@ -2303,13 +2533,16 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
     let mut selection = SelectedChecks {
         block_gap: false,
         tx_gap: false,
+        receipts_gap: false,
         tx_mismatch: false,
         duplicates: false,
         tx_duplicates: false,
+        receipts_duplicates: false,
         mutations: false,
         optimize_blocks: false,
         optimize_transactions: false,
         sync_status: false,
+        show_schema: false,
     };
 
     if read == 0 || input.trim().is_empty() {
@@ -2322,6 +2555,7 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
         selection.optimize_blocks = false;
         selection.optimize_transactions = false;
         selection.sync_status = true;
+        selection.show_schema = true;
         return Ok(selection);
     }
 
@@ -2334,44 +2568,68 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
             "1" | "block" | "block_gap" | "blocks" | "gap" => {
                 selection.block_gap = true;
             }
-            "2" | "tx" | "transactions" | "transaction" | "tx_mismatch" => {
-                selection.tx_mismatch = true;
-            }
-            "3" | "dup" | "duplicate" | "duplicates" => {
-                selection.duplicates = true;
-            }
-            "4" | "tx_gap" | "transaction_gap" | "transactions_gap" | "transactions_block_gap" => {
+            "2"
+            | "tx_gap"
+            | "transaction_gap"
+            | "transactions_gap"
+            | "transactions_block_gap" => {
                 selection.tx_gap = true;
             }
-            "5" | "mutation" | "mutations" | "unfinished" | "unfinished_mutations" => {
-                selection.mutations = true;
+            "3" | "receipts_gap" | "receipt_gap" | "receipts_block_gap" => {
+                selection.receipts_gap = true;
             }
-            "6" | "optimize" | "optimize_blocks" | "optimize-blocks" => {
-                selection.optimize_blocks = true;
+            "4" | "tx" | "transactions" | "transaction" | "tx_mismatch" => {
+                selection.tx_mismatch = true;
             }
-            "7" | "optimize_tx" | "optimize_transactions" | "optimize-transactions" => {
-                selection.optimize_transactions = true;
+            "5" | "dup" | "duplicate" | "duplicates" => {
+                selection.duplicates = true;
             }
-            "8"
+            "6"
             | "tx_duplicates"
             | "duplicate_transactions"
             | "duplicate-tx"
             | "duplicate_hashes" => {
                 selection.tx_duplicates = true;
             }
-            "9" | "sync" | "sync_status" | "syncing" | "eth_sync" => {
+            "7"
+            | "receipts_duplicates"
+            | "receipt_duplicates"
+            | "duplicate_receipts"
+            | "duplicate-receipts" => {
+                selection.receipts_duplicates = true;
+            }
+            "8" | "mutation" | "mutations" | "unfinished" | "unfinished_mutations" => {
+                selection.mutations = true;
+            }
+            "9" | "schema" | "columns" | "show_schema" | "show-columns" => {
+                selection.show_schema = true;
+            }
+            "10" | "optimize" | "optimize_all" | "optimize-both" => {
+                selection.optimize_blocks = true;
+                selection.optimize_transactions = true;
+            }
+            "11" | "optimize_blocks" | "optimize-blocks" => {
+                selection.optimize_blocks = true;
+            }
+            "12" | "optimize_tx" | "optimize_transactions" | "optimize-transactions" => {
+                selection.optimize_transactions = true;
+            }
+            "13" | "sync" | "sync_status" | "syncing" | "eth_sync" => {
                 selection.sync_status = true;
             }
             "all" | "a" => {
                 selection.block_gap = true;
                 selection.tx_gap = true;
+                selection.receipts_gap = true;
                 selection.tx_mismatch = true;
                 selection.duplicates = true;
                 selection.tx_duplicates = true;
+                selection.receipts_duplicates = true;
                 selection.mutations = true;
                 selection.optimize_blocks = true;
                 selection.optimize_transactions = true;
                 selection.sync_status = true;
+                selection.show_schema = true;
             }
             other => {
                 bail!("Unknown selection: `{}`", other);
@@ -2381,13 +2639,16 @@ fn prompt_check_selection() -> Result<SelectedChecks> {
 
     if !selection.block_gap
         && !selection.tx_gap
+        && !selection.receipts_gap
         && !selection.tx_mismatch
         && !selection.duplicates
         && !selection.tx_duplicates
+        && !selection.receipts_duplicates
         && !selection.mutations
         && !selection.optimize_blocks
         && !selection.optimize_transactions
         && !selection.sync_status
+        && !selection.show_schema
     {
         bail!("No checks selected.");
     }

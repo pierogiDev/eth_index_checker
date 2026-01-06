@@ -7,6 +7,7 @@ ClickHouse に保存された Ethereum のブロック／トランザクショ�
 - ブロック番号の連続性をチェックして欠番を報告
 - ClickHouse に格納されたトランザクション件数と Ethereum ノードの実数を照合
 - 実行開始時に対象テーブルのカラム一覧を表示し、設定ミスを早期発見
+- レシートテーブルの欠番・重複を検出（必要に応じて選択）
 - ブロック欠損検出時に、対話的に補完実行の可否を選択可能
 
 照合作業では [alloy](https://crates.io/crates/alloy) を用いて `eth_getBlockTransactionCountByNumber` を呼び出します。
@@ -40,6 +41,30 @@ cargo run --release -- \
   --eth-node-url http://localhost:8545
 ```
 
+実行後にチェック項目の選択画面が表示されます。Enter を押すと既定のチェック（欠番・件数不一致・重複検出・未完了 Mutation・カラム一覧表示・同期状況の確認）を実行し、最適化（OPTIMIZE TABLE）は含まれません。レシートのギャップ検知・重複検知は選択時のみ実行されます。
+
+選択画面ではカテゴリごとに番号が並び、カンマ区切りで複数指定できます。
+
+```
+Data integrity:
+  1) Block gap detection
+  2) Transaction table gap detection
+  3) Receipts table gap detection
+  4) Transaction count mismatch detection
+Duplicates:
+  5) Duplicate block detection
+  6) Duplicate transaction hash detection
+  7) Duplicate receipt hash detection
+Operations:
+  8) Unfinished mutation count
+  9) Show table columns
+  10) Optimize both tables (blocks + transactions)
+  11) Optimize blocks table only
+  12) Optimize transactions table only
+Node status:
+  13) Fetch Ethereum node sync status
+```
+
 ### CLI オプション
 
 | オプション | 環境変数 | 既定値 | 説明 |
@@ -53,6 +78,10 @@ cargo run --release -- \
 | `--blocks-number-column` | `BLOCKS_NUMBER_COLUMN` | `number` | ブロック番号カラム名 |
 | `--transactions-table` | `TRANSACTIONS_TABLE` | `transactions` | トランザクションテーブル名 |
 | `--transactions-block-column` | `TRANSACTIONS_BLOCK_COLUMN` | `block_number` | トランザクション側のブロック番号カラム名 |
+| `--transactions-hash-column` | `TRANSACTIONS_HASH_COLUMN` | `hash` | トランザクションハッシュのカラム名 |
+| `--receipts-table` | `RECEIPTS_TABLE` | `receipts` | レシートテーブル名 |
+| `--receipts-block-column` | `RECEIPTS_BLOCK_COLUMN` | `block_number` | レシート側のブロック番号カラム名 |
+| `--receipts-hash-column` | `RECEIPTS_HASH_COLUMN` | `transaction_hash` | レシートのトランザクションハッシュカラム名 |
 | `--eth-node-url` | `ETH_NODE_URL` | `.env` の値 / `http://localhost:8545` | Ethereum ノード RPC エンドポイント |
 
 ## 実行結果
